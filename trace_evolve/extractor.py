@@ -138,10 +138,14 @@ class QiMengLogParser:
         """解析 QiMeng-Agent 日志内容"""
         result = {
             "task_id": "",
+            "task_ids": [],
+            "task_count": 0,
             "iterations": 0,
             "final_code": "",
             "errors": [],
             "status": "unknown",
+            "status_counts": {},
+            "tasks": [],
             "feedback": "",  # checker 反馈
             "raw_content": log_content,
         }
@@ -153,72 +157,88 @@ class QiMengLogParser:
             result["errors"].append({"type": "parse_error", "message": "无法解析 JSON"})
             return result
 
-        # 提取任务信息
         tasks = data.get("tasks", [])
+        result["task_count"] = len(tasks)
 
-        # 遍历所有任务
         for task in tasks:
             task_id = task.get("task_id", "")
             final_result = task.get("final_result") or {}
+            task_status = final_result.get("status", "unknown")
+            task_summary = {
+                "task_id": task_id,
+                "iterations": final_result.get("iterations", 0),
+                "status": task_status,
+                "errors": [],
+            }
 
-            # 提取迭代次数
-            result["iterations"] = final_result.get("iterations", 0)
+            result["iterations"] = max(
+                result["iterations"], final_result.get("iterations", 0)
+            )
 
-            # 提取最终状态
-            status = final_result.get("status", "unknown")
-            result["status"] = status
-
-            # 提取代码
-            if final_result.get("final_output"):
+            if not result["final_code"] and final_result.get("final_output"):
                 result["final_code"] = final_result["final_output"]
 
-            # 提取验证结果
             check_result = final_result.get("check_result") or {}
 
-            # 提取 errors
             errors = check_result.get("errors", [])
             for err in errors:
-                result["errors"].append(
-                    {
-                        "type": err.get("type", "unknown"),
-                        "message": err.get("description", ""),
-                    }
-                )
+                error_entry = {
+                    "task_id": task_id,
+                    "type": err.get("type", "unknown"),
+                    "message": err.get("description", ""),
+                }
+                result["errors"].append(error_entry)
+                task_summary["errors"].append(error_entry)
 
-            # 提取 feedback
             feedback = check_result.get("feedback", "")
-            if feedback:
+            if feedback and not result["feedback"]:
                 result["feedback"] = feedback
 
-            # 提取 verification 中的详细信息
             verification = check_result.get("verification", {})
             for tool, verif_data in verification.items():
                 result_data = verif_data.get("result", {})
                 error_type = result_data.get("type", "")
 
                 if error_type == "compile error":
-                    result["errors"].append(
-                        {
-                            "type": "compile_error",
-                            "message": result_data.get("detail", ""),
-                            "tool": tool,
-                        }
-                    )
+                    error_entry = {
+                        "task_id": task_id,
+                        "type": "compile_error",
+                        "message": result_data.get("detail", ""),
+                        "tool": tool,
+                    }
+                    result["errors"].append(error_entry)
+                    task_summary["errors"].append(error_entry)
                 elif error_type == "simulation error":
-                    result["errors"].append(
-                        {
-                            "type": "simulation_error",
-                            "message": result_data.get("detail", ""),
-                            "tool": tool,
-                        }
-                    )
+                    error_entry = {
+                        "task_id": task_id,
+                        "type": "simulation_error",
+                        "message": result_data.get("detail", ""),
+                        "tool": tool,
+                    }
+                    result["errors"].append(error_entry)
+                    task_summary["errors"].append(error_entry)
                 elif error_type == "pass":
-                    result["status"] = "pass"
+                    task_summary["status"] = "pass"
 
-            # 只处理第一个任务（通常日志只有一个任务）
             if task_id:
-                result["task_id"] = task_id
-                break
+                result["task_ids"].append(task_id)
+                if not result["task_id"]:
+                    result["task_id"] = task_id
+
+            result["tasks"].append(task_summary)
+
+        status_counts: Dict[str, int] = {}
+        for task_summary in result["tasks"]:
+            status = task_summary.get("status", "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+        result["status_counts"] = status_counts
+        if status_counts:
+            if status_counts.get("failed"):
+                result["status"] = "failed"
+            elif status_counts.get("completed"):
+                result["status"] = "completed"
+            elif status_counts.get("pass"):
+                result["status"] = "pass"
 
         return result
 

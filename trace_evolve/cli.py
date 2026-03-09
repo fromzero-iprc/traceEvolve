@@ -206,7 +206,8 @@ def main():
             print(f"  - {f}")
 
     if not args.api_key:
-        print("警告：未设置 LLM API Key，将使用模拟模式进行演示")
+        print("错误：未设置 LLM API Key。请通过 --api-key 或 LLM_API_KEY 提供。")
+        sys.exit(1)
 
     # 处理日志文件
     results = pipeline.process_log_files(

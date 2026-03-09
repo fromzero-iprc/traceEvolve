@@ -256,7 +256,7 @@ class ExperienceManager:
                 )
 
         except (json.JSONDecodeError, ValueError) as e:
-            print(f"Warning: failed to parse merge response: {e}")
+            raise ValueError(f"Failed to parse merge response: {e}") from e
 
         return operations
 
