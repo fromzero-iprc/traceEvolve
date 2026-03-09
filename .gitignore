@@ -1,1 +1,8 @@
 __pycache__/
+data/
+intermediate_results/
+experience_pool.json
+experiences_for_icl.txt
+test_log.log
+session-ses_*.md
+AGENTS.md
