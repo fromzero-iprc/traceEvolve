@@ -1,6 +1,7 @@
 """
 配置文件 - 定义 LLM API 配置和提示模板
 """
+
 import os
 from typing import Optional
 from dataclasses import dataclass, field
@@ -9,12 +10,13 @@ from dataclasses import dataclass, field
 @dataclass
 class LLMConfig:
     """LLM 配置"""
+
     api_key: str = ""
     api_base: str = ""
     model: str = "gpt-4"
     temperature: float = 0.7
-    max_tokens: int = 40960
-    
+    max_tokens: int = 16384
+
     @classmethod
     def from_env(cls, prefix: str = "LLM") -> "LLMConfig":
         """从环境变量加载配置"""
@@ -30,40 +32,105 @@ class LLMConfig:
 @dataclass
 class EvolveConfig:
     """经验演化配置"""
+
     # LLM 配置
     extractor_llm: LLMConfig = field(default_factory=LLMConfig)
     manager_llm: LLMConfig = field(default_factory=LLMConfig)
-    
+
     # 经验池路径
     experience_pool_path: str = "experience_pool.json"
-    
+
     # 每次从日志中提取的最大经验数
     max_experiences_per_log: int = 10
-    
+
     # 经验池最大容量
     max_pool_size: int = 100
-    
+
     # 是否保存中间结果
     save_intermediate: bool = True
     intermediate_dir: str = "intermediate_results"
 
 
-# 提示模板
-EXPERIENCE_EXTRACTION_PROMPT = '''你是一个 BangC/MLU 编程专家。请分析以下解决 BangC 问题的日志记录，该日志包含了模型生成代码、代码的编译/执行反馈、以及多轮修正的过程。
+# 提示模板 - 英文版本（默认）
+EXPERIENCE_EXTRACTION_PROMPT = """You are an expert at extracting reusable Verilog benchmark lessons from agent execution logs.
 
-请从中提取有价值的经验教训（不超过 {max_experiences} 条）。每条经验应该是针对具体的编译/执行反馈错误进行的，并有一定的普适性。
+The input may contain:
+- raw task prompts
+- model-generated Verilog
+- checker or evaluator feedback
+- iterative repair history
+- a parsed structured summary generated from the log
+
+Your job is to extract high-value lessons (no more than {max_experiences} items) that improve future single-file Verilog benchmark generation.
+
+Prioritize lessons in this order:
+1. Interface/specification mistakes: wrong module name, wrong ports, wrong widths, wrong reset behavior
+2. Functional design mistakes: FSM bugs, FIFO full/empty logic, signed/unsigned issues, counter overflow, CDC, pipeline staging
+3. Output-format mistakes: malformed YAML/JSON, bad fenced-code structure, extra narrative around final code
+4. Process improvements only when they directly prevent benchmark failures
+
+What to avoid:
+- Do NOT extract generic repo-management advice unless the log clearly proves it caused the failure
+- Do NOT extract lessons about compiling multiple Verilog files together unless the benchmark truly depends on multiple source files
+- Do NOT produce vague lessons like 'be careful' or 'check syntax'
+- Do NOT output Chinese; all fields and all text must be English
+
+When a parsed structured summary is present, trust it more than noisy raw log fragments.
+Prefer benchmark-specific lessons over generic advice.
+If multiple failures share one root cause, produce one stronger generalized lesson instead of duplicates.
+
+Examples of good lessons:
+- problem: Module name does not exactly match the required top module name
+  solution: Copy the required module name from the task statement verbatim and verify case sensitivity before finalizing code
+- problem: FIFO full and empty logic uses incorrect pointer comparison, causing data corruption
+  solution: Use one extra pointer bit or Gray-coded synchronized pointers for asynchronous FIFO full/empty detection
+- problem: YAML mapping fails because explanatory text and code are mixed in the same fenced block
+  solution: Keep executable Verilog inside the fenced block only, and move explanations outside the code block
+
+Log content:
+```
+{log_content}
+```
+
+Output requirements:
+- Return valid JSON only
+- Keep code_pattern very short or omit it entirely
+- Use short, concrete, reusable one-line problem and solution fields
+- Keep category names in English and reasonably normalized
+- Prefer ids in lowercase snake_case
+
+```json
+{{
+  "experiences": [
+    {{
+      "id": "unique_id",
+      "category": "category name",
+      "problem": "one line problem description",
+      "solution": "one line solution",
+      "task_type": "optional",
+      "importance": "high/medium/low"
+    }}
+  ]
+}}
+```
+"""
+
+# 中文版本（保留）
+EXPERIENCE_EXTRACTION_PROMPT_CN = """你是一个 Verilog 编程专家。请分析以下解决 Verilog 问题的日志记录，该日志包含了模型生成代码、代码的编译/仿真反馈、以及多轮修正的过程。
+
+请从中提取有价值的经验教训（不超过 {max_experiences} 条）。每条经验应该是针对具体的编译/仿真反馈错误进行的，并有一定的普适性。
 
 **示例经验：**
-- problem: 编译错误 reference to __mlu_device__ function in __mlu_host__
-    - solution: 检查是否用了 __mlu_func__ 而非 __mlu_entry__
-- problem: 编译错误 cannot use variable-length arrays
-    - solution: 检查 __nram__ 数组是否为常量大小
-- problem: 编译错误 Cannot select: ... __fixunsdfsi
-    - solution: 检查是否使用了 sqrtf, fmin 等 host 函数
-- problem: 运行结果错误（数值不匹配）
-    - solution: 检查 tiling 逻辑是否正确处理边界（tile_size 计算）、mean/var 是否累加完整
-- problem: 运行结果 inf 或 nan
-    - solution: 检查 epsilon 是否正确加到 variance 上，以及 rsqrt 输入是否为正
+- problem: 编译错误 module name mismatch
+    - solution: 检查模块名是否与测试bench期望的一致
+- problem: 编译错误 port width mismatch
+    - solution: 检查信号位宽是否匹配
+- problem: 编译错误 syntax error near
+    - solution: 检查是否有缺失的分号、括号或拼写错误
+- problem: 仿真错误 result mismatch
+    - solution: 检查时序逻辑和组合逻辑的边界条件  
+- problem: 仿真错误 inf or nan
+    - solution: 检查除零操作和负数开方
 
 **日志内容：**
 ```
@@ -76,7 +143,7 @@ EXPERIENCE_EXTRACTION_PROMPT = '''你是一个 BangC/MLU 编程专家。请分�
     "experiences": [
         {{
             "id": "唯一标识符",
-            "category": "问题类别，如：内存管理、编译错误、算法优化、API使用等",
+            "category": "问题类别，如：语法错误、编译错误、仿真错误、时序问题、模块实例化等",
             "problem": "问题的描述",
             "solution": "解决方案",
             "code_pattern": "可选：相关的代码模式或示例片段",
@@ -88,52 +155,55 @@ EXPERIENCE_EXTRACTION_PROMPT = '''你是一个 BangC/MLU 编程专家。请分�
 
 请确保：
 - 如果这个日志最终生成出了正确代码，那么尤其要关注日志中的迭代经验，因为说明这种迭代最终能导出正确的结果
-'''
+"""
 
-EXPERIENCE_MERGE_PROMPT = '''你是一个经验库管理专家。现在有一个已有的经验库，以及从新日志中提取的新经验。你需要判断如何将新经验整合到已有经验库中。
+EXPERIENCE_MERGE_PROMPT = """You are an experience-pool curator for Verilog benchmark lessons.
 
-**已有经验库：**
+Existing experience pool:
 ```json
 {existing_experiences}
 ```
 
-**新提取的经验：**
+Newly extracted experiences:
 ```json
 {new_experiences}
 ```
 
-请分析新旧经验，输出操作指令列表。可执行的操作有：
-1. **INSERT** - 插入新经验（当该经验是全新的、没有重复的）
-2. **DELETE** - 删除旧经验（当旧经验已过时或被更好的经验替代）
-3. **REPLACE** - 替换旧经验（当新经验是旧经验的改进版本）
-4. **MERGE** - 合并经验（当多条经验可以整合为一条更全面的经验）
-5. **SKIP** - 跳过（当新经验与已有经验完全重复）
+Decide how to integrate the new experiences into the pool.
+Allowed actions:
+1. INSERT - add a truly new experience
+2. DELETE - remove an outdated or lower-value existing experience
+3. REPLACE - replace an existing experience with a better new version
+4. MERGE - merge overlapping experiences into one stronger experience
+5. SKIP - ignore a redundant new experience
 
-**请以 JSON 格式输出操作列表：**
+Rules:
+- Output valid JSON only
+- All text must be in English
+- Keep reason concise and specific
+- Prefer more benchmark-relevant, more reusable, and more concrete experiences
+- Remove duplicates and near-duplicates
+- Prefer normalized English categories
+- Do not keep repo-specific or low-signal experiences when a more general benchmark lesson exists
+
 ```json
 {{
-    "operations": [
-        {{
-            "action": "INSERT/DELETE/REPLACE/MERGE/SKIP",
-            "target_ids": ["要操作的经验ID列表，对于INSERT可以为空"],
-            "new_experience": {{
-                "id": "新经验的ID（如果需要插入或替换）",
-                "category": "类别",
-                "problem": "问题描述",
-                "solution": "解决方案",
-                "code_pattern": "代码模式（可选）",
-                "importance": "high/medium/low"
-            }},
-            "reason": "操作原因说明"
-        }}
-    ],
-    "summary": "本次合并操作的总结说明"
+  "operations": [
+    {{
+      "action": "INSERT/DELETE/REPLACE/MERGE/SKIP",
+      "target_ids": ["existing_id_1"],
+      "new_experience": {{
+        "id": "new_id",
+        "category": "category",
+        "problem": "problem description",
+        "solution": "solution description",
+        "code_pattern": "optional short pattern",
+        "importance": "high/medium/low"
+      }},
+      "reason": "short English explanation"
+    }}
+  ],
+  "summary": "short English summary"
 }}
 ```
-
-请确保：
-1. 仔细检查语义相似的经验，避免重复
-2. 保留更具体、更有价值的版本
-3. 合理控制经验库规模，删除低价值或过时的经验
-4. 对于每个操作给出清晰的理由
-'''
+"""

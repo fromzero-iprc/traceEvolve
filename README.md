@@ -46,6 +46,18 @@ python -m trace_evolve.cli --dir benchmarks/KernelBench/logs/level1
 # Process specified files
 python -m trace_evolve.cli --files log1.log log2.log
 
+# Process QiMeng-Agent JSON logs
+python -m trace_evolve.cli --files /path/to/run_20260307_225128.json --qimeng
+
+# Process a QiMeng-Agent log directory
+python -m trace_evolve.cli --dir /path/to/qimeng/logs --qimeng
+
+# Attach eval.jsonl feedback when extracting from QiMeng-Agent runs
+python -m trace_evolve.cli \
+  --files /path/to/run_20260307_225128.json \
+  --qimeng \
+  --eval-file /path/to/results/20260307_225128_iter10/eval.jsonl
+
 # Specify experience pool path
 python -m trace_evolve.cli --dir logs --pool my_experience_pool.json
 
@@ -156,6 +168,29 @@ Edit the templates in `trace_evolve/config.py`:
   - `*_extracted.json`: Extraction results per file
   - `merge_*.json`: Merge operation records
   - `final_report.json`: Final report
+
+## QiMeng-Agent Support
+
+This repo now supports extracting experiences from QiMeng-Agent benchmark runs.
+
+- `--qimeng` enables QiMeng log parsing
+- QiMeng directory mode searches for `run_*.json` first
+- `--eval-file` lets the extractor see benchmark failure details without corrupting the original JSON log structure
+
+Recommended usage:
+
+```bash
+python -m trace_evolve.cli \
+  --files /path/to/run_20260307_225128.json \
+  --qimeng \
+  --eval-file /path/to/results/20260307_225128_iter10/eval.jsonl \
+  --pool /path/to/experience_pool.json \
+  --batch-size 1 \
+  --intermediate-dir intermediate_results \
+  --verbose
+```
+
+Set `LLM_API_KEY`, `LLM_API_BASE`, and `LLM_MODEL` through environment variables or pass them explicitly from the CLI.
 
 ## License
 
