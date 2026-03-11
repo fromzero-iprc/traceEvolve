@@ -44,7 +44,7 @@ class EvolveConfig:
     max_experiences_per_log: int = 10
 
     # 经验池最大容量
-    max_pool_size: int = 500
+    max_pool_size: int = 100
 
     # 是否保存中间结果
     save_intermediate: bool = True

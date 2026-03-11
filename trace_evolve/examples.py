@@ -70,7 +70,7 @@ def example_pipeline_usage():
         ),
         experience_pool_path="experience_pool.json",
         max_experiences_per_log=5,
-        max_pool_size=500,
+        max_pool_size=100,
         save_intermediate=True,
         intermediate_dir="intermediate_results",
     )

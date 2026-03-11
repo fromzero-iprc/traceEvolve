@@ -96,6 +96,9 @@ If results regress again, check these first:
 2. whether the extracted experiences are benchmark-specific enough
 3. whether the configured model/base URL still match the actual runtime environment
 4. whether `eval.jsonl` is being attached for QiMeng benchmark runs
+5. whether prompt truncation is dropping late-task details in large `run_*.json` logs
+6. if truncation is hurting extraction quality, consider sorting or prioritizing failed/error tasks before building the prompt
+7. if a single `run_*.json` contains too many tasks, consider splitting the run by task chunks, extracting experiences per chunk, and then merging/deduplicating at the pool level
 
 ## Push / PR Reminder
 

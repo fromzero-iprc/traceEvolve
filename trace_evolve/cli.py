@@ -117,8 +117,8 @@ def parse_args():
     parser.add_argument(
         "--max-pool-size",
         type=int,
-        default=500,
-        help="经验池最大容量 (默认：500)",
+        default=100,
+        help="经验池最大容量 (默认：100)",
     )
     parser.add_argument("--no-intermediate", action="store_true", help="不保存中间结果")
     parser.add_argument(
