@@ -210,7 +210,6 @@ def main():
         log_files,
         batch_size=args.batch_size,
         use_qimeng_parser=args.qimeng,
-        eval_file_path=args.eval_file,
     )
 
     print("\n" + "=" * 60)
