@@ -55,7 +55,7 @@ def find_qimeng_log_files(directory: str) -> List[str]:
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
-        description="ICL Evolve - BangC 编程经验提取和管理工具",
+        description="TraceEvolve - 编程经验提取和管理工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -117,8 +117,8 @@ def parse_args():
     parser.add_argument(
         "--max-pool-size",
         type=int,
-        default=100,
-        help="经验池最大容量 (默认：100)",
+        default=500,
+        help="经验池最大容量 (默认：500)",
     )
     parser.add_argument("--no-intermediate", action="store_true", help="不保存中间结果")
     parser.add_argument(
@@ -143,10 +143,6 @@ def parse_args():
         "--qimeng",
         action="store_true",
         help="使用 QiMengLogParser 解析 QiMeng-Agent 日志格式",
-    )
-    parser.add_argument(
-        "--eval-file",
-        help="eval.jsonl 文件路径（用于补充 QiMeng-Agent 日志的错误信息）",
     )
 
     return parser.parse_args()
