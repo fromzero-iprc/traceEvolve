@@ -44,7 +44,7 @@ class EvolveConfig:
     max_experiences_per_log: int = 10
 
     # 经验池最大容量
-    max_pool_size: int = 100
+    max_pool_size: int = 500
 
     # 是否保存中间结果
     save_intermediate: bool = True
@@ -157,6 +157,97 @@ EXPERIENCE_EXTRACTION_PROMPT_CN = """你是一个 Verilog 编程专家。请分�
 - 如果这个日志最终生成出了正确代码，那么尤其要关注日志中的迭代经验，因为说明这种迭代最终能导出正确的结果
 """
 
+SEGMENT_EXTRACTION_PROMPT = """You are an expert at extracting reusable Verilog benchmark lessons from a SINGLE task's execution record.
+
+Below is the structured execution record of one Verilog benchmark task.
+It contains the original specification, checker errors, self-correction audit results,
+checker feedback, verification outcomes, and the final generated Verilog code.
+
+Your job: extract 0 to {max_experiences} high-value, concrete, reusable lessons from THIS task.
+
+CRITICAL RULES:
+- If this task passed cleanly with no errors, warnings, or interesting patterns, output 0 experiences.
+- Every experience MUST include an "evidence" field: a SHORT quote or reference from the task data
+  that proves this lesson is real (e.g. the actual error message, the problematic code snippet, or
+  the checker feedback sentence). Do NOT fabricate evidence.
+- Do NOT produce vague lessons like "be careful with syntax" or "test thoroughly".
+- Each lesson must be specific enough that a Verilog code generator can act on it.
+- All text must be in English.
+- Prefer lowercase_snake_case for ids.
+
+Prioritize:
+1. Specification/interface mismatches (wrong module name, wrong ports, wrong widths, wrong reset polarity)
+2. Functional logic bugs (FSM errors, FIFO logic, signed/unsigned, counter overflow, CDC, pipeline)
+3. Warnings or risks flagged by self-correction audit even if the task ultimately passed
+4. Output format issues (malformed code blocks, extra text inside fenced code)
+
+Task execution record:
+```
+{task_content}
+```
+
+Output valid JSON only:
+```json
+{{{{
+  "experiences": [
+    {{{{
+      "id": "lowercase_snake_case_id",
+      "category": "category name",
+      "problem": "one-line problem description",
+      "solution": "one-line actionable solution",
+      "evidence": "short quote from the task data proving this lesson",
+      "importance": "high/medium/low",
+      "task_id": "{task_id}"
+    }}}}
+  ]
+}}}}
+```
+"""
+
+SINGLE_EXPERIENCE_MERGE_PROMPT = """You are an experience-pool curator for Verilog benchmark lessons.
+
+Candidate existing experiences (same category, similar problem):
+```json
+{existing_candidates}
+```
+
+New experience to integrate:
+```json
+{new_experience}
+```
+
+Decide ONE action:
+1. INSERT - add as truly new (no overlap with candidates)
+2. REPLACE - replace one candidate with this better version (target_ids: [old_id])
+3. MERGE - merge with one or more candidates into one stronger experience
+4. SKIP - redundant with existing
+
+Rules:
+- When the new experience is clearly more specific, more actionable, and better evidenced than an older generic one in the same cluster, prefer REPLACE or MERGE over SKIP.
+- Output valid JSON only. Return exactly one operation.
+
+```json
+{{
+  "operations": [
+    {{
+      "action": "INSERT/REPLACE/MERGE/SKIP",
+      "target_ids": ["existing_id_or_empty"],
+      "new_experience": {{
+        "id": "new_id",
+        "category": "category",
+        "problem": "problem description",
+        "solution": "solution description",
+        "evidence": "optional",
+        "task_id": "optional",
+        "importance": "high/medium/low"
+      }},
+      "reason": "short explanation"
+    }}
+  ]
+}}
+```
+"""
+
 EXPERIENCE_MERGE_PROMPT = """You are an experience-pool curator for Verilog benchmark lessons.
 
 Existing experience pool:
@@ -185,6 +276,7 @@ Rules:
 - Remove duplicates and near-duplicates
 - Prefer normalized English categories
 - Do not keep repo-specific or low-signal experiences when a more general benchmark lesson exists
+- When a new experience is clearly more specific, more actionable, and better evidenced than an older generic one in the same lesson cluster, prefer REPLACE or MERGE over SKIP
 
 ```json
 {{
@@ -198,7 +290,9 @@ Rules:
         "problem": "problem description",
         "solution": "solution description",
         "code_pattern": "optional short pattern",
-        "importance": "high/medium/low"
+        "importance": "high/medium/low",
+        "evidence": "optional short quote",
+        "task_id": "optional task id"
       }},
       "reason": "short English explanation"
     }}

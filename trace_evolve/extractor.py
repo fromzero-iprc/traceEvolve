@@ -4,11 +4,12 @@
 
 import json
 import re
+import concurrent.futures
 from typing import List, Dict, Any, Optional
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
-from .config import LLMConfig, EXPERIENCE_EXTRACTION_PROMPT
+from .config import LLMConfig, EXPERIENCE_EXTRACTION_PROMPT, SEGMENT_EXTRACTION_PROMPT
 
 
 @dataclass
@@ -22,6 +23,8 @@ class Experience:
     code_pattern: Optional[str] = None
     importance: str = "medium"  # high, medium, low
     source_file: Optional[str] = None
+    evidence: Optional[str] = None
+    task_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -36,6 +39,8 @@ class Experience:
             code_pattern=data.get("code_pattern"),
             importance=data.get("importance", "medium"),
             source_file=data.get("source_file"),
+            evidence=data.get("evidence"),
+            task_id=data.get("task_id"),
         )
 
 
@@ -242,6 +247,207 @@ class QiMengLogParser:
 
         return result
 
+    def segment_tasks(self, log_content: str) -> List["TaskSegment"]:
+        """
+        将 QiMeng-Agent 日志按 task 切分为结构化 segment，
+        每个 segment 包含单个 task 的完整上下文并附带优先级打分。
+        """
+        try:
+            data = json.loads(log_content)
+        except json.JSONDecodeError:
+            return []
+
+        segments: List[TaskSegment] = []
+        for task in data.get("tasks", []):
+            seg = TaskSegment.from_task_dict(task)
+            segments.append(seg)
+
+        segments.sort(key=lambda s: s.priority_score, reverse=True)
+        return segments
+
+
+@dataclass
+class TaskSegment:
+    """单个 task 的结构化 segment，用于 per-task 经验提取。"""
+
+    task_id: str = ""
+    question: str = ""
+    status: str = "unknown"
+    passornot: bool = False
+    iterations: int = 0
+    errors: List[Dict[str, Any]] = field(default_factory=list)
+    feedback: str = ""
+    suggestions: List[str] = field(default_factory=list)
+    verification_detail: str = ""
+    final_code: str = ""
+    final_output: str = ""
+    self_correction_errors: List[Dict[str, Any]] = field(default_factory=list)
+    code_unchanged: Optional[bool] = None
+    error_count: int = 0
+    task_time_seconds: float = 0.0
+    priority_score: int = 0
+    task_error: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def from_task_dict(cls, task: Dict[str, Any]) -> "TaskSegment":
+        task_id = task.get("task_id", "")
+        question = task.get("question", "")
+        final_result = task.get("final_result") or {}
+        check_result = final_result.get("check_result") or {}
+        metrics = task.get("metrics") or {}
+
+        status = final_result.get("status", "unknown")
+        passornot = bool(check_result.get("passornot", False))
+        iterations = final_result.get("iterations", 0) or metrics.get("iterations", 0)
+        errors = list(check_result.get("errors", []))
+        feedback = check_result.get("feedback", "")
+        suggestions = check_result.get("suggestions", [])
+        final_output = final_result.get("final_output", "") or ""
+
+        # agent-level error (e.g. Missing 'subtasks' in response)
+        task_error = task.get("error")
+        if task_error and isinstance(task_error, dict):
+            errors.append({
+                "type": task_error.get("type", "agent_error"),
+                "description": task_error.get("message", str(task_error)),
+            })
+            if not final_result:
+                status = "error"
+
+        # verification detail
+        verif_parts: List[str] = []
+        verification = check_result.get("verification", {})
+        for tool_name, verif_data in verification.items():
+            if isinstance(verif_data, dict):
+                rd = verif_data.get("result", {})
+                vtype = rd.get("type", "")
+                vdetail = rd.get("detail", "")
+                verif_parts.append(f"[{tool_name}] type={vtype}, detail={vdetail}")
+        verification_detail = "\n".join(verif_parts)
+
+        # extract verilog code from final_output
+        final_code = cls._extract_verilog(final_output)
+
+        # self_correction_audit
+        sc_errors: List[Dict[str, Any]] = []
+        code_unchanged: Optional[bool] = None
+        for phase in task.get("phases", []):
+            if phase.get("phase") == "self_correction_audit":
+                pd = phase.get("data", {})
+                sc_errors = pd.get("errors_found", [])
+                code_unchanged = pd.get("code_unchanged")
+
+        error_count = len(errors) + len(sc_errors)
+        task_time_seconds = metrics.get("total_time_seconds", 0.0)
+
+        seg = cls(
+            task_id=task_id,
+            question=question,
+            status=status,
+            passornot=passornot,
+            iterations=iterations,
+            errors=errors,
+            feedback=feedback,
+            suggestions=suggestions,
+            verification_detail=verification_detail,
+            final_code=final_code,
+            final_output=final_output,
+            self_correction_errors=sc_errors,
+            code_unchanged=code_unchanged,
+            error_count=error_count,
+            task_time_seconds=task_time_seconds,
+            task_error=task_error if isinstance(task_error, dict) else None,
+        )
+        seg.priority_score = seg._compute_priority()
+        return seg
+
+    def _compute_priority(self) -> int:
+        score = 0
+        if self.task_error:
+            score += 80
+        if not self.passornot:
+            score += 100
+        if self.verification_detail:
+            vd_lower = self.verification_detail.lower()
+            if "compile error" in vd_lower or "simulation error" in vd_lower:
+                score += 60
+        if self.errors:
+            score += 40 + 10 * len(self.errors)
+        if self.self_correction_errors:
+            score += 25 + 5 * len(self.self_correction_errors)
+        if self.iterations >= 2:
+            score += 15
+        if self.iterations >= 4:
+            score += 15
+        if self.task_time_seconds > 180:
+            score += 10
+        if self.task_time_seconds > 300:
+            score += 10
+        if self.code_unchanged is False:
+            score += 10
+        if self.suggestions:
+            score += 5
+        fb_lower = self.feedback.lower()
+        for kw in ("logic", "compile", "simulation", "mismatch", "warning"):
+            if kw in fb_lower:
+                score += 10
+                break
+        return score
+
+    def render_for_prompt(self) -> str:
+        """渲染为 LLM 可读的结构化文本。"""
+        parts = [
+            f"=== Task: {self.task_id} ===",
+            f"Status: {self.status} | Pass: {self.passornot} | "
+            f"Iterations: {self.iterations} | Priority: {self.priority_score}",
+        ]
+        if self.task_error:
+            parts.append(
+                f"\n--- Agent Error (task failed before code generation) ---\n"
+                f"  Type: {self.task_error.get('type', '?')}\n"
+                f"  Message: {self.task_error.get('message', '?')}"
+            )
+        if self.question:
+            parts.append(f"\n--- Question ---\n{self.question}")
+        if self.errors:
+            parts.append("\n--- Checker Errors ---")
+            for err in self.errors:
+                parts.append(
+                    f"  [{err.get('type', '?')}] {err.get('description', err.get('message', ''))}"
+                )
+        if self.self_correction_errors:
+            parts.append("\n--- Self-Correction Audit Errors ---")
+            for err in self.self_correction_errors:
+                parts.append(
+                    f"  [{err.get('type', '?')}] (severity={err.get('severity', '?')}) "
+                    f"{err.get('description', '')}"
+                )
+        if self.feedback:
+            parts.append(f"\n--- Checker Feedback ---\n{self.feedback}")
+        if self.suggestions:
+            parts.append("\n--- Suggestions ---")
+            for s in self.suggestions:
+                parts.append(f"  - {s}")
+        if self.verification_detail:
+            parts.append(f"\n--- Verification ---\n{self.verification_detail}")
+        if self.final_code:
+            parts.append(f"\n--- Final Verilog Code ---\n{self.final_code}")
+        elif self.final_output:
+            parts.append(f"\n--- Final Output ---\n{self.final_output}")
+        return "\n".join(parts)
+
+    @staticmethod
+    def _extract_verilog(text: str) -> str:
+        if not text:
+            return ""
+        pattern = r"```verilog(.*?)```"
+        blocks = re.findall(pattern, text, re.DOTALL)
+        if blocks:
+            return "\n\n".join(b.strip() for b in blocks)
+        pattern2 = r"(module\s+\w+(?:\s*#\s*\([^)]*\))?\s*\([^)]*\)\s*;.*?endmodule)"
+        modules = re.findall(pattern2, text, re.DOTALL)
+        return "\n\n".join(modules) if modules else ""
+
 
 class LLMClient:
     """LLM 客户端 - 调用大模型 API (支持 OpenAI 和火山引擎 Ark)"""
@@ -309,11 +515,17 @@ class LLMClient:
 class ExperienceExtractor:
     """经验提取器 - 从日志中提取经验"""
 
-    def __init__(self, llm_config: LLMConfig, max_experiences: int = 10):
+    def __init__(
+        self,
+        llm_config: LLMConfig,
+        max_experiences: int = 10,
+        max_workers: int = 8,
+    ):
         self.llm_client = LLMClient(llm_config)
         self.log_parser = LogParser()
         self.qimeng_log_parser = QiMengLogParser()
         self.max_experiences = max_experiences
+        self.max_workers = max_workers
 
     def extract_from_file(
         self, log_file: str, use_qimeng_parser: bool = False
@@ -344,47 +556,109 @@ class ExperienceExtractor:
         log_content: str,
         source_file: Optional[str] = None,
         use_qimeng_parser: bool = False,
-        supplemental_context: Optional[str] = None,
     ) -> List[Experience]:
         """
         从日志内容提取经验。
+
+        QiMeng 模式下走 per-segment 并发提取（每个 task 单独调 LLM），
+        非 QiMeng 模式保留旧的单轮提取逻辑。
 
         Args:
             log_content: 原始日志内容
             source_file: 来源文件名
             use_qimeng_parser: 是否使用 QiMeng 日志解析模式
-            supplemental_context: 额外补充给 LLM 的上下文，不参与日志解析
 
         Returns:
             提取出的经验列表
         """
-        parser = self.qimeng_log_parser if use_qimeng_parser else self.log_parser
-        parsed_log = parser.parse(log_content)
+        if use_qimeng_parser:
+            return self._extract_qimeng_per_segment(log_content, source_file)
+        return self._extract_legacy(log_content, source_file)
 
-        # 结构化摘要与原始日志一起提供给 LLM，避免只依赖长文本中的零散片段。
+    # ── QiMeng per-segment 并发提取 ──────────────────────────────
+
+    def _extract_qimeng_per_segment(
+        self,
+        log_content: str,
+        source_file: Optional[str],
+    ) -> List[Experience]:
+        segments = self.qimeng_log_parser.segment_tasks(log_content)
+        if not segments:
+            print("警告: 未能从日志中解析出任何 task segment")
+            return self._extract_legacy(log_content, source_file)
+
+        print(
+            f"[Segment] 共 {len(segments)} 个 task segment，"
+            f"按 priority 排序: "
+            + ", ".join(
+                f"{s.task_id}({s.priority_score})" for s in segments[:10]
+            )
+            + ("..." if len(segments) > 10 else "")
+        )
+
+        all_experiences: List[Experience] = []
+
+        def _extract_one(seg: TaskSegment) -> List[Experience]:
+            rendered = seg.render_for_prompt()
+            prompt = SEGMENT_EXTRACTION_PROMPT.format(
+                max_experiences=3,
+                task_content=rendered,
+                task_id=seg.task_id,
+            )
+            try:
+                response = self.llm_client.call(prompt)
+                exps = self._parse_llm_response(response, source_file)
+                for exp in exps:
+                    if not exp.task_id:
+                        exp.task_id = seg.task_id
+                return exps
+            except Exception as e:
+                print(f"  [错误] 提取 {seg.task_id} 经验失败: {e}")
+                return []
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_workers
+        ) as executor:
+            futures = {
+                executor.submit(_extract_one, seg): seg for seg in segments
+            }
+            for future in concurrent.futures.as_completed(futures):
+                seg = futures[future]
+                try:
+                    exps = future.result()
+                    if exps:
+                        print(
+                            f"  [Segment] {seg.task_id} "
+                            f"(priority={seg.priority_score}): "
+                            f"提取了 {len(exps)} 条经验"
+                        )
+                    all_experiences.extend(exps)
+                except Exception as e:
+                    print(f"  [错误] {seg.task_id} future 异常: {e}")
+
+        print(f"[Segment] 共提取 {len(all_experiences)} 条候选经验")
+        return all_experiences
+
+    # ── 旧的单轮提取逻辑（非 QiMeng 日志） ────────────────────
+
+    def _extract_legacy(
+        self,
+        log_content: str,
+        source_file: Optional[str],
+    ) -> List[Experience]:
+        parsed_log = self.log_parser.parse(log_content)
         parsed_log_text = json.dumps(parsed_log, ensure_ascii=False, indent=2)
         prompt_content = (
             log_content[:12000]
             + "\n\n=== Parsed Structured Summary ===\n"
             + parsed_log_text[:3000]
         )
-
-        if supplemental_context:
-            prompt_content += (
-                "\n\n=== Additional Evaluation Context ===\n"
-                + supplemental_context[:3000]
-            )
-
         prompt = EXPERIENCE_EXTRACTION_PROMPT.format(
             max_experiences=self.max_experiences,
             log_content=prompt_content,
         )
-
         response = self.llm_client.call(prompt)
-
-        experiences = self._parse_llm_response(response, source_file)
-
-        return experiences
+        return self._parse_llm_response(response, source_file)
 
     def _parse_llm_response(
         self, response: str, source_file: Optional[str] = None
@@ -475,6 +749,8 @@ class ExperienceExtractor:
                     "code_pattern": grab("code_pattern") or None,
                     "importance": grab("importance") or "medium",
                     "source_file": source_file,
+                    "evidence": grab("evidence") or None,
+                    "task_id": grab("task_id") or None,
                 }
             )
             if exp.problem and exp.solution:
