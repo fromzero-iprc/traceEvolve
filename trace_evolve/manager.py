@@ -10,8 +10,11 @@ from pathlib import Path
 from enum import Enum
 from datetime import datetime
 
-from .config import LLMConfig, EXPERIENCE_MERGE_PROMPT
+from .config import LLMConfig, EXPERIENCE_MERGE_PROMPT, SINGLE_EXPERIENCE_MERGE_PROMPT
 from .extractor import Experience, LLMClient
+from .postprocessor import ExperiencePostProcessor
+from .quality import quality_score
+from .utils import calculate_similarity
 
 
 class OperationType(Enum):
@@ -172,6 +175,10 @@ class ExperienceManager:
         if batch_id is None:
             batch_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+        # 归一化池中旧经验的 category
+        if len(self.pool) > 0:
+            ExperiencePostProcessor.normalize_pool(self.pool)
+
         # 如果经验池为空，直接插入所有新经验
         if len(self.pool) == 0:
             for exp in new_experiences:
@@ -197,26 +204,17 @@ class ExperienceManager:
             self.pool.save()
             return result
 
-        # 调用 LLM 决定如何合并
-        prompt = EXPERIENCE_MERGE_PROMPT.format(
-            existing_experiences=self.pool.to_json(),
-            new_experiences=json.dumps(
-                [exp.to_dict() for exp in new_experiences], ensure_ascii=False, indent=2
-            ),
-        )
-
-        response = self.llm_client.call(prompt)
-
-        # 解析并执行操作
-        operations = self._parse_merge_response(response)
+        # 候选级局部 merge：每条新经验先找 top-k 旧候选，再局部 LLM 或规则预判
         pool_size_before = len(self.pool)
+        operations: List[Operation] = []
 
-        for op in operations:
-            self._execute_operation(op, batch_id)
+        for new_exp in new_experiences:
+            op = self._merge_single(new_exp, batch_id)
+            if op:
+                operations.append(op)
+                self._execute_operation(op, batch_id)
 
-        # 检查是否超出最大容量
         self._enforce_pool_limit()
-
         self.pool.save()
 
         return {
@@ -226,6 +224,80 @@ class ExperienceManager:
             "pool_size_after": len(self.pool),
             "summary": f"执行了 {len(operations)} 个操作",
         }
+
+    def _find_candidates(self, new_exp: Experience, top_k: int = 5) -> List[Experience]:
+        """按 category 过滤 + problem Jaccard 相似度取 top-k 旧候选。"""
+        same_cat = [
+            e for e in self.pool.get_all()
+            if e.category == new_exp.category and e.id != new_exp.id
+        ]
+        if not same_cat:
+            return []
+
+        scored = [
+            (e, calculate_similarity(new_exp.problem, e.problem))
+            for e in same_cat
+        ]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [e for e, _ in scored[:top_k]]
+
+    def _merge_single(
+        self, new_exp: Experience, batch_id: str
+    ) -> Optional[Operation]:
+        """
+        对单条新经验做合并决策：无候选则 INSERT；有候选则规则预判或 LLM。
+        """
+        candidates = self._find_candidates(new_exp, top_k=5)
+
+        if not candidates:
+            return Operation(
+                action=OperationType.INSERT,
+                target_ids=[],
+                new_experience=new_exp,
+                reason="No similar candidate in pool",
+            )
+
+        # 规则预判：新经验明显优于某旧候选则直接 REPLACE
+        best_cand = candidates[0]
+        sim = calculate_similarity(new_exp.problem, best_cand.problem)
+        if sim >= 0.5:
+            q_new = quality_score(new_exp)
+            q_old = quality_score(best_cand)
+            if q_new - q_old >= 3:
+                return Operation(
+                    action=OperationType.REPLACE,
+                    target_ids=[best_cand.id],
+                    new_experience=new_exp,
+                    reason=f"Rule REPLACE: quality_score new={q_new:.1f} old={q_old:.1f}",
+                )
+
+        # LLM 局部 merge
+        prompt = SINGLE_EXPERIENCE_MERGE_PROMPT.format(
+            existing_candidates=json.dumps(
+                [e.to_dict() for e in candidates], ensure_ascii=False, indent=2
+            ),
+            new_experience=json.dumps(new_exp.to_dict(), ensure_ascii=False, indent=2),
+        )
+        try:
+            response = self.llm_client.call(prompt)
+            ops = self._parse_merge_response(response)
+            if ops:
+                return ops[0]
+            # 解析成功但无操作，fallback INSERT
+            return Operation(
+                action=OperationType.INSERT,
+                target_ids=[],
+                new_experience=new_exp,
+                reason="LLM returned no operation, fallback INSERT",
+            )
+        except Exception as e:
+            print(f"[Merge] LLM parse failed for {new_exp.id}: {e}, fallback INSERT")
+            return Operation(
+                action=OperationType.INSERT,
+                target_ids=[],
+                new_experience=new_exp,
+                reason=f"Fallback INSERT after LLM error: {e}",
+            )
 
     def _parse_merge_response(self, response: str) -> List[Operation]:
         """解析 LLM 合并响应"""
@@ -305,17 +377,13 @@ class ExperienceManager:
         self.pool.record_operation(operation, batch_id)
 
     def _enforce_pool_limit(self):
-        """确保经验池不超过最大容量"""
+        """确保经验池不超过最大容量，按 quality_score 综合排序裁剪。"""
         if len(self.pool) <= self.max_pool_size:
             return
 
-        # 按重要性和时间排序，删除低优先级的经验
         experiences = self.pool.get_all()
-        importance_order = {"high": 0, "medium": 1, "low": 2}
+        experiences.sort(key=lambda x: quality_score(x), reverse=True)
 
-        experiences.sort(key=lambda x: importance_order.get(x.importance, 1))
-
-        # 保留前 max_pool_size 条
         to_keep = set(exp.id for exp in experiences[: self.max_pool_size])
         to_remove = [exp.id for exp in experiences if exp.id not in to_keep]
 
@@ -331,9 +399,8 @@ class ExperienceManager:
         """获取经验，用于构建提示词"""
         experiences = self.pool.get_all()
 
-        # 按重要性排序
-        importance_order = {"high": 0, "medium": 1, "low": 2}
-        experiences.sort(key=lambda x: importance_order.get(x.importance, 1))
+        # 按 quality_score 排序
+        experiences.sort(key=lambda x: quality_score(x), reverse=True)
 
         # 取前 max_count 条
         selected = experiences[:max_count]

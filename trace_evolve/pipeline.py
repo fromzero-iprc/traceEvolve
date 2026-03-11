@@ -10,6 +10,7 @@ from datetime import datetime
 from .config import EvolveConfig, LLMConfig
 from .extractor import ExperienceExtractor, Experience
 from .manager import ExperienceManager, ExperiencePool
+from .postprocessor import ExperiencePostProcessor
 
 
 class EvolvePipeline:
@@ -52,11 +53,17 @@ class EvolvePipeline:
             log_files: 日志文件路径列表
             batch_size: 每批处理的文件数量
             use_qimeng_parser: 是否使用 QiMeng 日志解析模式
-            eval_file_path: 可选的 eval 结果文件，用于补充错误信息
+            eval_file_path: deprecated, kept for CLI compatibility but no longer used
 
         Returns:
             处理结果摘要
         """
+        if eval_file_path:
+            print(
+                "[警告] --eval-file 已弃用：日志中的 check_result/verification "
+                "已包含更丰富的错误信息，无需额外注入 eval.jsonl"
+            )
+
         results = {
             "total_files": len(log_files),
             "processed_files": 0,
@@ -83,7 +90,6 @@ class EvolvePipeline:
                 batch,
                 batch_id,
                 use_qimeng_parser=use_qimeng_parser,
-                eval_file_path=eval_file_path,
             )
             results["batches"].append(batch_result)
             results["processed_files"] += batch_result["processed_count"]
@@ -105,7 +111,6 @@ class EvolvePipeline:
         log_files: List[str],
         batch_id: str,
         use_qimeng_parser: bool = False,
-        eval_file_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         处理单个批次。
@@ -114,7 +119,6 @@ class EvolvePipeline:
             log_files: 当前批次的日志文件列表
             batch_id: 批次标识符
             use_qimeng_parser: 是否使用 QiMeng 日志解析模式
-            eval_file_path: 可选的 eval 结果文件，用于补充错误信息
 
         Returns:
             当前批次的处理结果
@@ -137,23 +141,10 @@ class EvolvePipeline:
                 if use_qimeng_parser:
                     log_content = Path(log_file).read_text(encoding="utf-8")
 
-                    eval_errors = ""
-                    if eval_file_path and Path(eval_file_path).exists():
-                        with open(eval_file_path, "r", encoding="utf-8") as f:
-                            for line in f:
-                                eval_data = json.loads(line)
-                                task_id = eval_data.get("task_id", "")
-                                error_type = eval_data.get("type", "")
-                                detail = eval_data.get("detail", "")
-
-                                if error_type in ["compile error", "failed", "no code"]:
-                                    eval_errors += f"Task: {task_id}, Error: {error_type}, Detail: {detail}\n"
-
                     experiences = self.extractor.extract_from_content(
                         log_content,
                         Path(log_file).name,
                         use_qimeng_parser=True,
-                        supplemental_context=eval_errors or None,
                     )
                 else:
                     experiences = self.extractor.extract_from_file(
@@ -176,9 +167,13 @@ class EvolvePipeline:
                 print(f"  [错误] {error_msg}")
                 batch_result["errors"].append(error_msg)
 
+        # 2. 规则后处理（归一化、过滤、去重）
+        postprocessor = ExperiencePostProcessor()
+        all_experiences = postprocessor.process(all_experiences)
+
         batch_result["experiences_extracted"] = len(all_experiences)
 
-        # 2. 合并到经验池
+        # 3. 合并到经验池
         if all_experiences:
             print(f"\n[合并] 将 {len(all_experiences)} 条经验合并到经验池...")
             try:
