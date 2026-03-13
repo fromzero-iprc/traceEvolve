@@ -257,8 +257,12 @@ class QiMengLogParser:
         except json.JSONDecodeError:
             return []
 
+        tasks = data.get("tasks", [])
+        if not tasks and data.get("task_id"):
+            tasks = [data]
+
         segments: List[TaskSegment] = []
-        for task in data.get("tasks", []):
+        for task in tasks:
             seg = TaskSegment.from_task_dict(task)
             segments.append(seg)
 
@@ -307,10 +311,12 @@ class TaskSegment:
         # agent-level error (e.g. Missing 'subtasks' in response)
         task_error = task.get("error")
         if task_error and isinstance(task_error, dict):
-            errors.append({
-                "type": task_error.get("type", "agent_error"),
-                "description": task_error.get("message", str(task_error)),
-            })
+            errors.append(
+                {
+                    "type": task_error.get("type", "agent_error"),
+                    "description": task_error.get("message", str(task_error)),
+                }
+            )
             if not final_result:
                 status = "error"
 
@@ -590,9 +596,7 @@ class ExperienceExtractor:
         print(
             f"[Segment] 共 {len(segments)} 个 task segment，"
             f"按 priority 排序: "
-            + ", ".join(
-                f"{s.task_id}({s.priority_score})" for s in segments[:10]
-            )
+            + ", ".join(f"{s.task_id}({s.priority_score})" for s in segments[:10])
             + ("..." if len(segments) > 10 else "")
         )
 
@@ -619,9 +623,7 @@ class ExperienceExtractor:
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self.max_workers
         ) as executor:
-            futures = {
-                executor.submit(_extract_one, seg): seg for seg in segments
-            }
+            futures = {executor.submit(_extract_one, seg): seg for seg in segments}
             for future in concurrent.futures.as_completed(futures):
                 seg = futures[future]
                 try:

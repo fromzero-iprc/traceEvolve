@@ -9,4 +9,16 @@ experience_pool.json
 experiences_for_icl.txt
 test_log.log
 session-ses_*.md
+
+# Agent-facing internal docs (not for GitHub)
 AGENTS.md
+trace_evolve/AGENTS.md
+AI_HANDOFF.md
+SUMMARY.md
+problem.md
+jingyan.md
+.cursor/
+
+# Runtime artifacts
+experience_spool/
+*.history.jsonl
