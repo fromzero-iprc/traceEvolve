@@ -19,6 +19,8 @@ _CATEGORY_ALIASES: Dict[str, str] = {
     "functional design": "Functional Logic",
     "functional logic": "Functional Logic",
     "functional logic bugs": "Functional Logic",
+    "functional_logic": "Functional Logic",
+    "functional_logic_bugs": "Functional Logic",
     "functional": "Functional Logic",
     "design error": "Functional Logic",
     "task-specific design errors": "Functional Logic",
@@ -26,6 +28,10 @@ _CATEGORY_ALIASES: Dict[str, str] = {
     "control logic": "Functional Logic",
     "design pattern": "Functional Logic",
     "fifo design error": "Functional Logic",
+    "data_path_design": "Functional Logic",
+    "control_logic_design": "Functional Logic",
+    "implementation_pattern": "Functional Logic",
+    "functional_logic_bugs": "Functional Logic",
     # Interface Compliance
     "specification/interface mismatch": "Interface Compliance",
     "specification mismatch": "Interface Compliance",
@@ -33,6 +39,9 @@ _CATEGORY_ALIASES: Dict[str, str] = {
     "specification compliance": "Interface Compliance",
     "specification interpretation": "Interface Compliance",
     "interface/implementation": "Interface Compliance",
+    "interface": "Interface Compliance",
+    "interface_compliance": "Interface Compliance",
+    "specification/interface_mismatches": "Interface Compliance",
     # Compilation Error
     "compile error": "Compilation Error",
     "compilation error": "Compilation Error",
@@ -64,6 +73,12 @@ _CATEGORY_ALIASES: Dict[str, str] = {
     "language compliance": "Language Compliance",
     "coding_style": "Language Compliance",
     "coding style": "Language Compliance",
+    "syntax_and_language_compliance": "Language Compliance",
+    "syntax/compatibility": "Language Compliance",
+
+    # Verification / Process
+    "verification": "Verification",
+    "verification/functional": "Verification",
 }
 
 _VALID_IMPORTANCE: Set[str] = {"high", "medium", "low"}

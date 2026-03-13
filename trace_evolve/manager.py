@@ -2,9 +2,11 @@
 经验管理模块 - 管理经验池，执行经验合并操作
 """
 
+import concurrent.futures
 import json
+import os
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from enum import Enum
@@ -54,6 +56,18 @@ class ExperiencePool:
         self.pool_path = Path(pool_path) if pool_path else None
         self.experiences: Dict[str, Experience] = {}
         self.history: List[Dict[str, Any]] = []  # 操作历史
+        # history 控制：
+        # - TRACE_EVOLVE_POOL_HISTORY_MAX：内联保留的 history 条数上限（0 表示不内联保存）
+        # - TRACE_EVOLVE_POOL_HISTORY_ARCHIVE：是否把被裁剪的 history 追加写入归档 jsonl（默认 1）
+        self.history_max = int(os.getenv("TRACE_EVOLVE_POOL_HISTORY_MAX", "2000"))
+        self.history_archive = os.getenv(
+            "TRACE_EVOLVE_POOL_HISTORY_ARCHIVE", "1"
+        ) not in {
+            "0",
+            "false",
+            "False",
+            "no",
+        }
 
         if self.pool_path and self.pool_path.exists():
             self.load()
@@ -89,21 +103,90 @@ class ExperiencePool:
 
         self.pool_path.parent.mkdir(parents=True, exist_ok=True)
 
+        self._normalize_and_deduplicate_experiences()
+
         data = {
             "experiences": {
                 exp_id: exp.to_dict() for exp_id, exp in self.experiences.items()
             },
-            "history": self.history,
+            "history": [],
             "metadata": {
                 "last_updated": datetime.now().isoformat(),
                 "total_experiences": len(self.experiences),
             },
         }
 
-        self.pool_path.write_text(
+        tmp_path = self.pool_path.with_suffix(self.pool_path.suffix + ".tmp")
+        tmp_path.write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        os.replace(tmp_path, self.pool_path)
         print(f"经验池已保存，共 {len(self.experiences)} 条经验")
+
+    def _normalize_and_deduplicate_experiences(self) -> None:
+        """
+        对整个经验池做一次 category 归一化 + 全局去重。
+        归一化依赖 postprocessor 的 _CATEGORY_ALIASES；
+        去重逻辑重用 ExperiencePostProcessor._dedup_group。
+        """
+        if not self.experiences:
+            return
+
+        # 1) 归一化 category
+        ExperiencePostProcessor.normalize_pool(self)
+
+        # 2) 按归一化后 category 分组，全局去重
+        pp = ExperiencePostProcessor()
+        groups: Dict[str, List[Experience]] = {}
+        for exp in self.get_all():
+            groups.setdefault(exp.category, []).append(exp)
+
+        new_experiences: Dict[str, Experience] = {}
+        removed = 0
+        for cat, group in groups.items():
+            deduped = pp._dedup_group(group)
+            # 可能存在不同 id 但高度相似的经验，这里保留 _dedup_group 返回的子集
+            # 如果 id 冲突，则后者覆盖前者（通常 importance 更低的是被丢弃的一侧）
+            removed += len(group) - len(deduped)
+            for exp in deduped:
+                new_experiences[exp.id] = exp
+
+        if removed > 0:
+            print(
+                f"[PoolDedup] 池内去重：由 {len(self.experiences)} 条压缩为 {len(new_experiences)} 条 "
+                f"(移除 {removed})"
+            )
+        self.experiences = new_experiences
+
+    def _maybe_trim_and_archive_history(self) -> None:
+        """
+        控制 history 体积，避免 experience_pool.json 被 history 撑爆。
+        兼容性策略：仍保留顶层 history 字段，但只保留最近 N 条。
+        可选：把被裁剪的历史写入 pool 同目录的 *.history.jsonl 归档文件（append-only）。
+        """
+        if self.history_max < 0:
+            return
+
+        max_keep = max(0, self.history_max)
+        overflow = len(self.history) - max_keep
+        if overflow <= 0:
+            return
+
+        to_archive = self.history[:overflow]
+        self.history = self.history[overflow:]
+
+        if not (self.history_archive and self.pool_path):
+            return
+
+        archive_path = self.pool_path.with_suffix(
+            self.pool_path.suffix + ".history.jsonl"
+        )
+        try:
+            with open(archive_path, "a", encoding="utf-8") as handle:
+                for item in to_archive:
+                    handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"[History] 归档写入失败，将仅裁剪内联 history: {e}")
 
     def insert(self, experience: Experience) -> bool:
         """插入新经验"""
@@ -142,14 +225,15 @@ class ExperiencePool:
         )
 
     def record_operation(self, operation: Operation, batch_id: str):
-        """记录操作历史"""
-        self.history.append(
-            {
-                "batch_id": batch_id,
-                "timestamp": datetime.now().isoformat(),
-                "operation": operation.to_dict(),
-            }
-        )
+        """记录操作历史（当前已禁用，history 占 pool 文件 60%+ 且暂不使用）"""
+        # self.history.append(
+        #     {
+        #         "batch_id": batch_id,
+        #         "timestamp": datetime.now().isoformat(),
+        #         "operation": operation.to_dict(),
+        #     }
+        # )
+        pass
 
     def __len__(self):
         return len(self.experiences)
@@ -162,7 +246,7 @@ class ExperienceManager:
         self,
         llm_config: LLMConfig,
         pool_path: Optional[str] = None,
-        max_pool_size: int = 100,
+        max_pool_size: int = 450,
     ):
         self.llm_client = LLMClient(llm_config)
         self.pool = ExperiencePool(pool_path)
@@ -204,15 +288,19 @@ class ExperienceManager:
             self.pool.save()
             return result
 
-        # 候选级局部 merge：每条新经验先找 top-k 旧候选，再局部 LLM 或规则预判
         pool_size_before = len(self.pool)
-        operations: List[Operation] = []
 
-        for new_exp in new_experiences:
-            op = self._merge_single(new_exp, batch_id)
-            if op:
-                operations.append(op)
-                self._execute_operation(op, batch_id)
+        # Phase 1: 基于当前 pool 快照并发获取所有 LLM 决策
+        decisions = self._decide_all_concurrent(new_experiences, batch_id)
+
+        # Phase 2: 串行执行决策，处理冲突
+        operations: List[Operation] = []
+        for op in decisions:
+            if op is None:
+                continue
+            resolved = self._resolve_conflicts(op)
+            operations.append(resolved)
+            self._execute_operation(resolved, batch_id)
 
         self._enforce_pool_limit()
         self.pool.save()
@@ -225,25 +313,71 @@ class ExperienceManager:
             "summary": f"执行了 {len(operations)} 个操作",
         }
 
+    def _decide_all_concurrent(
+        self, new_experiences: List[Experience], batch_id: str
+    ) -> List[Optional[Operation]]:
+        max_workers = min(len(new_experiences), 8)
+        if max_workers <= 1:
+            return [self._merge_single(exp, batch_id) for exp in new_experiences]
+
+        results: List[Optional[Operation]] = [None] * len(new_experiences)
+
+        def _decide(idx: int, exp: Experience) -> Tuple[int, Optional[Operation]]:
+            return idx, self._merge_single(exp, batch_id)
+
+        total = len(new_experiences)
+        completed_count = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_decide, i, exp): i
+                for i, exp in enumerate(new_experiences)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                idx, op = future.result()
+                results[idx] = op
+                completed_count += 1
+                if completed_count % 20 == 0 or completed_count == total:
+                    print(f"[Merge] 已决策 {completed_count}/{total} 条经验")
+
+        return results
+
+    def _resolve_conflicts(self, op: Operation) -> Operation:
+        if op.action in (
+            OperationType.REPLACE,
+            OperationType.MERGE,
+            OperationType.DELETE,
+        ):
+            missing = [tid for tid in op.target_ids if self.pool.get(tid) is None]
+            if missing:
+                print(
+                    f"[Conflict] {op.action.value} targets {missing} already gone, "
+                    f"downgrading to INSERT for {op.new_experience.id if op.new_experience else '?'}"
+                )
+                return Operation(
+                    action=OperationType.INSERT,
+                    target_ids=[],
+                    new_experience=op.new_experience,
+                    reason=f"Conflict: original {op.action.value} targets {missing} removed by prior op",
+                )
+        return op
+
     def _find_candidates(self, new_exp: Experience, top_k: int = 5) -> List[Experience]:
         """按 category 过滤 + problem Jaccard 相似度取 top-k 旧候选。"""
         same_cat = [
-            e for e in self.pool.get_all()
+            e
+            for e in self.pool.get_all()
             if e.category == new_exp.category and e.id != new_exp.id
         ]
         if not same_cat:
             return []
 
         scored = [
-            (e, calculate_similarity(new_exp.problem, e.problem))
-            for e in same_cat
+            (e, calculate_similarity(new_exp.problem, e.problem)) for e in same_cat
         ]
         scored.sort(key=lambda x: x[1], reverse=True)
         return [e for e, _ in scored[:top_k]]
 
-    def _merge_single(
-        self, new_exp: Experience, batch_id: str
-    ) -> Optional[Operation]:
+    def _merge_single(self, new_exp: Experience, batch_id: str) -> Optional[Operation]:
         """
         对单条新经验做合并决策：无候选则 INSERT；有候选则规则预判或 LLM。
         """

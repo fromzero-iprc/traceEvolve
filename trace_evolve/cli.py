@@ -12,8 +12,11 @@ TraceEvolve - 命令行入口
     # 处理目录下的所有日志文件
     python -m trace_evolve.cli --dir path/to/logs
 
-    # 指定经验池路径
-    python -m trace_evolve.cli --dir path/to/logs --pool experience_pool.json
+    # 仅提取候选经验到 spool（不更新经验池）
+    python -m trace_evolve.cli --dir path/to/logs --qimeng --extract-only --spool experience_spool
+
+    # 单独合并 spool 到经验池
+    python -m trace_evolve.cli --merge-spool --spool experience_spool --pool experience_pool.json
 
     # 导出经验用于 ICL
     python -m trace_evolve.cli --export --pool experience_pool.json --output experiences.txt
@@ -30,7 +33,6 @@ from .pipeline import EvolvePipeline
 
 
 def find_log_files(directory: str, pattern: str = "*.log") -> List[str]:
-    """查找目录下的所有日志文件"""
     log_dir = Path(directory)
     if not log_dir.exists():
         raise FileNotFoundError(f"目录不存在: {directory}")
@@ -40,7 +42,6 @@ def find_log_files(directory: str, pattern: str = "*.log") -> List[str]:
 
 
 def find_qimeng_log_files(directory: str) -> List[str]:
-    """查找 QiMeng-Agent 生成的 JSON 日志文件。"""
     log_dir = Path(directory)
     if not log_dir.exists():
         raise FileNotFoundError(f"目录不存在: {directory}")
@@ -53,7 +54,6 @@ def find_qimeng_log_files(directory: str) -> List[str]:
 
 
 def parse_args():
-    """解析命令行参数"""
     parser = argparse.ArgumentParser(
         description="TraceEvolve - 编程经验提取和管理工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -68,17 +68,21 @@ def parse_args():
     # 处理指定文件
     python -m trace_evolve.cli --files log1.log log2.log
 
+    # 仅提取到 spool
+    python -m trace_evolve.cli --dir /path/to/qimeng/logs --qimeng --extract-only --spool experience_spool
+
+    # 单独合并 spool
+    python -m trace_evolve.cli --merge-spool --spool experience_spool --pool experience_pool.json
+
     # 导出经验
     python -m trace_evolve.cli --export --output experiences.txt
         """,
     )
 
-    # 输入选项
     input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument("--files", "-f", nargs="+", help="要处理的日志文件列表")
     input_group.add_argument("--dir", "-d", help="包含日志文件的目录")
 
-    # 输出选项
     parser.add_argument(
         "--pool",
         "-p",
@@ -91,8 +95,12 @@ def parse_args():
         default="intermediate_results",
         help="中间结果目录 (默认: intermediate_results)",
     )
+    parser.add_argument(
+        "--spool",
+        default="experience_spool",
+        help="候选经验 spool 目录 (默认: experience_spool)",
+    )
 
-    # LLM 配置
     parser.add_argument(
         "--api-key",
         default=os.getenv("LLM_API_KEY", ""),
@@ -117,8 +125,8 @@ def parse_args():
     parser.add_argument(
         "--max-pool-size",
         type=int,
-        default=100,
-        help="经验池最大容量 (默认：100)",
+        default=450,
+        help="经验池最大容量 (默认：450)",
     )
     parser.add_argument("--no-intermediate", action="store_true", help="不保存中间结果")
     parser.add_argument(
@@ -129,6 +137,16 @@ def parse_args():
         help="每批处理的文件数量 (默认：5)",
     )
     parser.add_argument("--export", "-e", action="store_true", help="导出经验用于 ICL")
+    parser.add_argument(
+        "--extract-only",
+        action="store_true",
+        help="仅提取候选经验并写入 spool，不更新经验池",
+    )
+    parser.add_argument(
+        "--merge-spool",
+        action="store_true",
+        help="从 spool 目录读取候选经验并单独合并到经验池",
+    )
     parser.add_argument(
         "--output",
         "-o",
@@ -149,7 +167,6 @@ def parse_args():
 
 
 def main():
-    """主函数"""
     args = parse_args()
 
     llm_config = LLMConfig(
@@ -175,13 +192,30 @@ def main():
             print(f"错误：经验池文件不存在：{args.pool}")
             sys.exit(1)
 
-        experiences = pipeline.export_experiences_for_icl(
+        pipeline.export_experiences_for_icl(
             output_path=args.output, max_count=args.export_count
         )
         print(f"\n已导出 {args.export_count} 条经验到 {args.output}")
         return
 
-    log_files = []
+    if args.merge_spool:
+        results = pipeline.merge_spool(args.spool)
+        print("\n" + "=" * 60)
+        print("Spool 合并完成!")
+        print("=" * 60)
+        print(f"Spool 文件数：{len(results['spool_files'])}")
+        print(f"读取经验数：{results['loaded_experiences']}")
+        print(f"无效行数：{results['invalid_lines']}")
+        if results["merge_result"]:
+            merge_result = results["merge_result"]
+            print(
+                f"经验池大小：{merge_result['pool_size_before']} -> {merge_result['pool_size_after']}"
+            )
+        if results["moved_files"]:
+            print(f"已移动到 merged/：{len(results['moved_files'])}")
+        return
+
+    log_files: List[str] = []
     if args.files:
         log_files = args.files
     elif args.dir:
@@ -198,26 +232,39 @@ def main():
 
     print(f"找到 {len(log_files)} 个日志文件")
     if args.verbose:
-        for f in log_files:
-            print(f"  - {f}")
+        for file_path in log_files:
+            print(f"  - {file_path}")
 
     if not args.api_key:
         print("错误：未设置 LLM API Key。请通过 --api-key 或 LLM_API_KEY 提供。")
         sys.exit(1)
 
-    # 处理日志文件
-    results = pipeline.process_log_files(
-        log_files,
-        batch_size=args.batch_size,
-        use_qimeng_parser=args.qimeng,
-    )
-
-    print("\n" + "=" * 60)
-    print("处理完成!")
-    print("=" * 60)
-    print(f"处理文件数：{results['processed_files']}/{results['total_files']}")
-    print(f"提取经验数：{results['total_experiences_extracted']}")
-    print(f"最终经验池大小：{results['final_pool_size']}")
+    if args.extract_only:
+        results = pipeline.extract_to_spool(
+            log_files,
+            spool_dir=args.spool,
+            batch_size=args.batch_size,
+            use_qimeng_parser=args.qimeng,
+        )
+        print("\n" + "=" * 60)
+        print("提取完成 (未更新经验池)!")
+        print("=" * 60)
+        print(f"处理文件数：{results['processed_files']}/{results['total_files']}")
+        print(f"提取经验数：{results['total_experiences_extracted']}")
+        if results["spool_file"]:
+            print(f"Spool 文件：{results['spool_file']}")
+    else:
+        results = pipeline.process_log_files(
+            log_files,
+            batch_size=args.batch_size,
+            use_qimeng_parser=args.qimeng,
+        )
+        print("\n" + "=" * 60)
+        print("处理完成!")
+        print("=" * 60)
+        print(f"处理文件数：{results['processed_files']}/{results['total_files']}")
+        print(f"提取经验数：{results['total_experiences_extracted']}")
+        print(f"最终经验池大小：{results['final_pool_size']}")
 
     if results["errors"]:
         print(f"\n遇到 {len(results['errors'])} 个错误:")
