@@ -11,6 +11,7 @@ from .config import EvolveConfig, LLMConfig
 from .extractor import ExperienceExtractor, Experience
 from .manager import ExperienceManager, ExperiencePool
 from .postprocessor import ExperiencePostProcessor
+from .quality import quality_score
 from .spool import (
     file_lock,
     infer_run_id,
@@ -18,6 +19,7 @@ from .spool import (
     move_to_merged,
     write_candidates_jsonl,
 )
+from .utils import calculate_similarity
 
 
 class EvolvePipeline:
@@ -158,6 +160,7 @@ class EvolvePipeline:
             "merge_result": None,
             "errors": [],
             "experiences": [],
+            "candidate_audit": {},
         }
 
         all_experiences: List[Experience] = []
@@ -195,9 +198,29 @@ class EvolvePipeline:
                 print(f"  [错误] {error_msg}")
                 batch_result["errors"].append(error_msg)
 
-        # 2. 规则后处理（归一化、过滤、去重）
+        raw_count = len(all_experiences)
+        raw_type_counts = self._count_by_type(all_experiences)
         postprocessor = ExperiencePostProcessor()
-        all_experiences = postprocessor.process(all_experiences)
+        prepared_experiences = postprocessor.prepare(all_experiences)
+        consolidated_experiences = self._consolidate_candidates(prepared_experiences)
+        all_experiences = postprocessor.deduplicate(consolidated_experiences)
+
+        batch_result["candidate_audit"] = {
+            "raw_count": raw_count,
+            "prepared_count": len(prepared_experiences),
+            "consolidated_count": len(consolidated_experiences),
+            "final_count": len(all_experiences),
+            "raw_type_counts": raw_type_counts,
+            "prepared_type_counts": self._count_by_type(prepared_experiences),
+            "final_type_counts": self._count_by_type(all_experiences),
+        }
+        print(
+            "[Audit] candidates "
+            f"raw={batch_result['candidate_audit']['raw_count']} "
+            f"prepared={batch_result['candidate_audit']['prepared_count']} "
+            f"consolidated={batch_result['candidate_audit']['consolidated_count']} "
+            f"final={batch_result['candidate_audit']['final_count']}"
+        )
 
         batch_result["experiences_extracted"] = len(all_experiences)
 
@@ -324,6 +347,94 @@ class EvolvePipeline:
         output_path.write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+
+    def _consolidate_candidates(self, experiences: List[Experience]) -> List[Experience]:
+        if not experiences:
+            return experiences
+
+        groups: Dict[tuple, List[Experience]] = {}
+        for exp in experiences:
+            groups.setdefault(
+                (
+                    str(exp.task_id or "").strip().lower(),
+                    str(exp.experience_type or "").strip().lower(),
+                    str(exp.root_cause_type or "").strip().lower(),
+                ),
+                [],
+            ).append(exp)
+
+        consolidated: List[Experience] = []
+        merged_count = 0
+        for group in groups.values():
+            ranked = sorted(group, key=quality_score, reverse=True)
+            kept: List[Experience] = []
+            for exp in ranked:
+                merged = False
+                for idx, existing in enumerate(kept):
+                    if self._should_consolidate(existing, exp):
+                        kept[idx] = self._merge_candidates(existing, exp)
+                        merged = True
+                        merged_count += 1
+                        break
+                if not merged:
+                    kept.append(exp)
+            consolidated.extend(kept)
+
+        if merged_count:
+            print(
+                f"[Consolidate] same-batch consolidated {merged_count} fragments -> "
+                f"{len(consolidated)} canonical candidates"
+            )
+        return consolidated
+
+    def _should_consolidate(self, existing: Experience, incoming: Experience) -> bool:
+        problem_sim = calculate_similarity(existing.problem or "", incoming.problem or "")
+        solution_sim = calculate_similarity(existing.solution or "", incoming.solution or "")
+        evidence_sim = calculate_similarity(existing.evidence or "", incoming.evidence or "")
+        score = problem_sim * 0.5 + solution_sim * 0.4 + evidence_sim * 0.1
+        if existing.root_cause_type == incoming.root_cause_type:
+            score += 0.05
+        if existing.experience_type == incoming.experience_type:
+            score += 0.05
+        if (existing.task_id or "").strip().lower() == (incoming.task_id or "").strip().lower():
+            score += 0.05
+        return score >= 0.46
+
+    def _merge_candidates(self, existing: Experience, incoming: Experience) -> Experience:
+        if quality_score(incoming) > quality_score(existing):
+            primary = incoming
+            secondary = existing
+        else:
+            primary = existing
+            secondary = incoming
+
+        merged_evidence = []
+        for item in (primary.evidence_list or []) + ([primary.evidence] if primary.evidence else []):
+            if item and item not in merged_evidence:
+                merged_evidence.append(item)
+        for item in (secondary.evidence_list or []) + ([secondary.evidence] if secondary.evidence else []):
+            if item and item not in merged_evidence:
+                merged_evidence.append(item)
+
+        merged_from = []
+        for item in (primary.merged_from or []) + [secondary.id] + (secondary.merged_from or []):
+            if item and item not in merged_from and item != primary.id:
+                merged_from.append(item)
+
+        primary.evidence_list = merged_evidence
+        primary.merged_from = merged_from
+        primary.confidence = max(primary.confidence or 0.0, secondary.confidence or 0.0)
+        if not primary.evidence and secondary.evidence:
+            primary.evidence = secondary.evidence
+        return primary
+
+    @staticmethod
+    def _count_by_type(experiences: List[Experience]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for exp in experiences:
+            key = str(exp.experience_type or "unknown")
+            counts[key] = counts.get(key, 0) + 1
+        return counts
 
     def _save_intermediate_merge(self, merge_result: Dict[str, Any], batch_id: str):
         """保存中间合并结果"""
