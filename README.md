@@ -1,25 +1,41 @@
 # TraceEvolve
 
-TraceEvolve extracts reusable lessons from agent execution logs and manages a curated experience pool for later in-context reuse.
+TraceEvolve extracts reusable implementation lessons from agent execution logs
+and evolves a curated experience pool for later in-context reuse.
 
-The current implementation is optimized for QiMeng-Agent benchmark logs and task snapshots.
+The current implementation is optimized for `QiMeng-Agent` task snapshots and
+benchmark logs.
 
 ## Current Version
 
-The current pipeline has three layers:
+The current pipeline is designed as a conservative canonicalization system
+rather than a "collect as many experiences as possible" system.
 
-1. QiMeng log parsing and per-task segmentation
-2. local cleanup before merge
-3. candidate-based pool merge or spool-based deferred merge
+The practical pipeline has four stages:
 
-Current practical workflow:
+1. parse QiMeng logs or task snapshots into task-local segments
+2. extract typed experience candidates with evidence and root-cause fields
+3. normalize, filter, consolidate, and deduplicate candidates locally
+4. merge into a single main pool, or defer merge through spool JSONL files
+
+Current design goals:
+
+- favor high-signal, evidence-backed experiences over broad noisy recall
+- reduce duplicated root-cause fragments before they reach the pool
+- keep the main pool usable for runtime retrieval in `QiMeng-Agent`
+- support deferred merge so extraction and curation can be decoupled
+
+Recommended workflow:
 
 - read a QiMeng run log or one-task snapshot JSON
-- split QiMeng logs into `TaskSegment`s
+- split QiMeng data into `TaskSegment`s
 - extract candidate experiences with concurrent LLM calls
-- normalize, filter, and deduplicate candidates locally
-- either merge immediately into the pool or write candidates to spool JSONL
-- later merge spool files into the main pool explicitly
+- run local post-processing:
+  - normalize category / type / root cause
+  - reject meta / style / speculative candidates
+  - consolidate same-batch duplicates
+- either merge immediately into the main pool or write to spool JSONL
+- later merge spool files into the pool explicitly
 
 This version also supports QiMeng-Agent's embedded async extraction worker:
 
@@ -52,26 +68,24 @@ If you are following the current QiMeng-Agent integration, use `python3.8` when 
 
 ## Quick Start
 
-### 1. Full extraction + merge
+### 1. Full extraction + immediate merge
 
-Process one QiMeng run log and update the pool immediately:
+Process one QiMeng run log and update a single main pool immediately:
 
 ```bash
 python3.8 -m trace_evolve.cli \
   --files /path/to/run_20260311_160600.json \
   --qimeng \
-  --pool-target extended \
-  --extended-pool /path/to/experience_pool_extended.json
+  --pool /path/to/experience_pool.json
 ```
 
-Process a directory of QiMeng run logs:
+Process a directory of QiMeng logs and merge directly:
 
 ```bash
 python3.8 -m trace_evolve.cli \
   --dir /path/to/qimeng/logs \
   --qimeng \
-  --pool-target extended \
-  --extended-pool /path/to/experience_pool_extended.json \
+  --pool /path/to/experience_pool.json \
   --batch-size 4 \
   --intermediate-dir intermediate_results
 ```
@@ -104,11 +118,10 @@ python3.8 -m trace_evolve.cli \
 python3.8 -m trace_evolve.cli \
   --merge-spool \
   --spool /path/to/experience_spool \
-  --pool-target extended \
-  --extended-pool /path/to/experience_pool_extended.json
+  --pool /path/to/experience_pool.json
 ```
 
-### 4. Split one legacy pool into core/extended
+### 4. Optional: split one pool into core/extended
 
 ```bash
 python3.8 -m trace_evolve.cli \
@@ -123,7 +136,7 @@ python3.8 -m trace_evolve.cli \
 ```bash
 python3.8 -m trace_evolve.cli \
   --export \
-  --core-pool /path/to/experience_pool_core.json \
+  --pool /path/to/experience_pool.json \
   --output experiences.txt
 ```
 
@@ -134,6 +147,7 @@ Main CLI modes in `trace_evolve/cli.py`:
 - default mode: extract and merge immediately
 - `--extract-only`: extract candidate experiences and write one spool JSONL file
 - `--merge-spool`: read all spool JSONL files, merge them into the pool, then move processed files to `merged/`
+- `--split-pool`: optional offline utility to derive `core/extended` views from one pool
 - `--export`: export top experiences for ICL
 
 Important notes:
@@ -143,6 +157,8 @@ Important notes:
 - task snapshot directories still work because the CLI falls back to generic `*.json` when no `run_*.json` exists.
 - `--eval-file` is no longer part of the CLI.
 - the CLI requires `LLM_API_KEY` for extraction paths, but not for `--merge-spool` or `--export`.
+- `--pool` is the simplest and recommended way to work with a single main pool.
+- `--core-pool` / `--extended-pool` are still supported for compatibility and optional split-pool workflows.
 
 ## Python API
 
@@ -187,11 +203,12 @@ trace_evolve/
 ├── __init__.py        # package exports
 ├── cli.py             # command-line entrypoint
 ├── config.py          # dataclasses and prompt templates
-├── extractor.py       # Experience, TaskSegment, parsers, concurrent extraction
-├── postprocessor.py   # normalization, filtering, batch-local dedup
-├── quality.py         # quality_score for replace/pool ranking
-├── manager.py         # candidate-level merge and pool management
-├── pipeline.py        # full pipeline + extract-only + merge-spool
+├── extractor.py       # Experience schema, TaskSegment, parsers, concurrent extraction
+├── postprocessor.py   # normalization, structural filtering, batch-local dedup
+├── quality.py         # quality_score for retain/replace/pool ranking
+├── manager.py         # merge-first pool management and candidate decisions
+├── pipeline.py        # full pipeline + extract-only + merge-spool + candidate audit
+├── pool_splitter.py   # optional deterministic split from one pool into core/extended
 ├── spool.py           # spool JSONL helpers and merged-file movement
 ├── utils.py           # JSON helpers and similarity utilities
 └── examples.py        # usage examples
@@ -206,7 +223,9 @@ QiMeng run log or task snapshot
   -> QiMengLogParser.segment_tasks()
   -> TaskSegment list sorted by priority_score
   -> ExperienceExtractor._extract_qimeng_per_segment()
-  -> ExperiencePostProcessor.process()
+  -> ExperiencePostProcessor.prepare()
+  -> same-batch consolidation
+  -> ExperiencePostProcessor.deduplicate()
   -> ExperienceManager.merge_experiences()
   -> ExperiencePool.save()
 ```
@@ -237,26 +256,87 @@ For non-QiMeng logs, the extractor still keeps the legacy whole-log path.
   "importance": "high",
   "source_file": "run_20260311_160600.json",
   "evidence": "simulation error: state mismatch after reset",
-  "task_id": "fsm_task"
+  "task_id": "fsm_task",
+  "experience_type": "functional_bug_fix",
+  "root_cause_type": "reset",
+  "task_scope": "task_specific",
+  "confidence": 0.82,
+  "canonical": true,
+  "evidence_list": [
+    "simulation error: state mismatch after reset"
+  ]
 }
 ```
 
-`code_pattern` is optional and may also be present.
+Optional fields such as `code_pattern` and `merged_from` may also be present.
+
+The current main-pool target experience types are:
+
+- `spec_compliance`
+- `functional_bug_fix`
+- `implementation_pattern`
+
+Meta/style/process candidates may still be extracted as intermediate candidates,
+but they are expected to be filtered out before entering the main pool.
 
 ## What Changed In Recent Versions
 
-### 1. Per-task QiMeng extraction
+### 1. Typed experience schema
 
-- `Experience` now includes `evidence` and `task_id`
-- `TaskSegment` was introduced to preserve one-task context
-- QiMeng extraction moved from one giant prompt to per-segment concurrent extraction
+- `Experience` now carries `experience_type`, `root_cause_type`, `task_scope`,
+  `confidence`, `canonical`, `evidence_list`, and `merged_from`
+- this makes later filtering and canonicalization much more reliable
 
-Main files:
+### 2. Stronger local cleanup before merge
 
-- `trace_evolve/extractor.py`
-- `trace_evolve/config.py`
+- normalize category / type / root cause aliases
+- reject meta / style / speculative / workaround-like candidates
+- require stronger actionability and evidence signals
 
-### 2. Local cleanup before merge
+### 3. Same-batch consolidation
+
+- reduce duplicate root-cause fragments before pool merge
+- expose candidate audit counts at each stage
+
+### 4. Merge-first pool management
+
+- prefer `MERGE` / `REPLACE` / `SKIP` over uncontrolled `INSERT`
+- normalize and deduplicate the pool again before save
+
+### 5. Optional split-pool support
+
+- keep one main pool as the default working set
+- support deterministic offline derivation of `core` and `extended` views when needed
+
+## Recommended Usage for QiMeng-Agent
+
+For the current QiMeng-Agent integration, the recommended workflow is:
+
+1. runtime writes task snapshots into `logs/run_x/tasks/*.json`
+2. `traceEvolve` runs in `--extract-only` mode and writes spool JSONL
+3. candidate quality is inspected if needed
+4. spool is merged explicitly into one main pool
+5. runtime retrieval later consumes the merged pool
+
+Recommended commands:
+
+```bash
+python3.8 -m trace_evolve.cli \
+  --dir /path/to/qimeng/logs/run_x/tasks \
+  --qimeng \
+  --extract-only \
+  --spool /path/to/experience_spool
+```
+
+```bash
+python3.8 -m trace_evolve.cli \
+  --merge-spool \
+  --spool /path/to/experience_spool \
+  --pool /path/to/experience_pool.json
+```
+
+This keeps extraction, inspection, and pool updates decoupled, which is the
+recommended path when pool quality matters.
 
 - postprocessing now normalizes categories, filters weak experiences, and removes near-duplicates before merge
 - merge quality uses `quality_score()` and candidate-level selection instead of full-pool prompting every time
