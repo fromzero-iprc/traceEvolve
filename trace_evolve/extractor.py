@@ -25,6 +25,13 @@ class Experience:
     source_file: Optional[str] = None
     evidence: Optional[str] = None
     task_id: Optional[str] = None
+    experience_type: Optional[str] = None
+    root_cause_type: Optional[str] = None
+    task_scope: Optional[str] = None
+    confidence: Optional[float] = None
+    canonical: Optional[bool] = None
+    evidence_list: Optional[List[str]] = None
+    merged_from: Optional[List[str]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -41,6 +48,13 @@ class Experience:
             source_file=data.get("source_file"),
             evidence=data.get("evidence"),
             task_id=data.get("task_id"),
+            experience_type=data.get("experience_type"),
+            root_cause_type=data.get("root_cause_type"),
+            task_scope=data.get("task_scope"),
+            confidence=data.get("confidence"),
+            canonical=data.get("canonical"),
+            evidence_list=data.get("evidence_list"),
+            merged_from=data.get("merged_from"),
         )
 
 
@@ -400,6 +414,35 @@ class TaskSegment:
                 break
         return score
 
+    def has_verification_failure_signal(self) -> bool:
+        detail = (self.verification_detail or "").lower()
+        keywords = (
+            "compile error",
+            "simulation error",
+            "function error",
+            "mismatch",
+            "timeout",
+            "failed",
+        )
+        return any(keyword in detail for keyword in keywords)
+
+    def has_severity(self, levels: List[str]) -> bool:
+        normalized = {level.lower() for level in levels}
+        for err in self.self_correction_errors:
+            severity = str(err.get("severity", "")).strip().lower()
+            if severity in normalized:
+                return True
+        return False
+
+    def is_clean_pass(self) -> bool:
+        return (
+            self.passornot
+            and not self.errors
+            and not self.self_correction_errors
+            and not self.task_error
+            and not self.has_verification_failure_signal()
+        )
+
     def render_for_prompt(self) -> str:
         """渲染为 LLM 可读的结构化文本。"""
         parts = [
@@ -601,11 +644,21 @@ class ExperienceExtractor:
         )
 
         all_experiences: List[Experience] = []
+        segment_budgets = [(seg, self._extraction_budget(seg)) for seg in segments]
+        scheduled_segments = [(seg, budget) for seg, budget in segment_budgets if budget > 0]
+        skipped_segments = [seg.task_id for seg, budget in segment_budgets if budget <= 0]
+        if skipped_segments:
+            print(
+                f"[Segment] 跳过 {len(skipped_segments)} 个低信号 segment: "
+                + ", ".join(skipped_segments[:10])
+                + ("..." if len(skipped_segments) > 10 else "")
+            )
+        print(f"[Segment] 进入提取的 segment 数量: {len(scheduled_segments)}")
 
-        def _extract_one(seg: TaskSegment) -> List[Experience]:
-            rendered = seg.render_for_prompt()
+        def _extract_one(seg: TaskSegment, max_experiences: int) -> List[Experience]:
+            rendered = self._render_segment_for_extraction(seg)
             prompt = SEGMENT_EXTRACTION_PROMPT.format(
-                max_experiences=3,
+                max_experiences=max_experiences,
                 task_content=rendered,
                 task_id=seg.task_id,
             )
@@ -613,25 +666,32 @@ class ExperienceExtractor:
                 response = self.llm_client.call(prompt)
                 exps = self._parse_llm_response(response, source_file)
                 for exp in exps:
-                    if not exp.task_id:
-                        exp.task_id = seg.task_id
+                    self._hydrate_experience(exp, seg)
+                if len(exps) > max_experiences:
+                    exps = exps[:max_experiences]
                 return exps
             except Exception as e:
                 print(f"  [错误] 提取 {seg.task_id} 经验失败: {e}")
                 return []
 
+        if not scheduled_segments:
+            return []
+
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self.max_workers
         ) as executor:
-            futures = {executor.submit(_extract_one, seg): seg for seg in segments}
+            futures = {
+                executor.submit(_extract_one, seg, budget): (seg, budget)
+                for seg, budget in scheduled_segments
+            }
             for future in concurrent.futures.as_completed(futures):
-                seg = futures[future]
+                seg, budget = futures[future]
                 try:
                     exps = future.result()
                     if exps:
                         print(
                             f"  [Segment] {seg.task_id} "
-                            f"(priority={seg.priority_score}): "
+                            f"(priority={seg.priority_score}, budget={budget}): "
                             f"提取了 {len(exps)} 条经验"
                         )
                     all_experiences.extend(exps)
@@ -660,7 +720,10 @@ class ExperienceExtractor:
             log_content=prompt_content,
         )
         response = self.llm_client.call(prompt)
-        return self._parse_llm_response(response, source_file)
+        experiences = self._parse_llm_response(response, source_file)
+        for exp in experiences:
+            self._hydrate_experience(exp, None)
+        return experiences
 
     def _parse_llm_response(
         self, response: str, source_file: Optional[str] = None
@@ -753,11 +816,174 @@ class ExperienceExtractor:
                     "source_file": source_file,
                     "evidence": grab("evidence") or None,
                     "task_id": grab("task_id") or None,
+                    "experience_type": grab("experience_type") or None,
+                    "root_cause_type": grab("root_cause_type") or None,
+                    "task_scope": grab("task_scope") or None,
+                    "confidence": self._safe_float(grab("confidence")),
                 }
             )
             if exp.problem and exp.solution:
                 experiences.append(exp)
         return experiences
+
+    def _extraction_budget(self, seg: TaskSegment) -> int:
+        if seg.is_clean_pass():
+            return 0
+        if seg.task_error:
+            return 2
+        if not seg.passornot:
+            if seg.has_severity(["high", "critical"]) or seg.has_verification_failure_signal():
+                return 2
+            return 1
+        if seg.errors or seg.has_severity(["medium", "high", "critical"]) or seg.has_verification_failure_signal():
+            return 1
+        return 0
+
+    def _render_segment_for_extraction(self, seg: TaskSegment) -> str:
+        parts = [
+            f"=== Task: {seg.task_id} ===",
+            (
+                f"Status: {seg.status} | Pass: {seg.passornot} | "
+                f"Iterations: {seg.iterations} | Priority: {seg.priority_score}"
+            ),
+        ]
+        if seg.question:
+            parts.append(f"\n--- Question ---\n{seg.question}")
+        if seg.errors:
+            parts.append("\n--- Checker Errors ---")
+            for err in seg.errors:
+                parts.append(
+                    f"  [{err.get('type', '?')}] {err.get('description', err.get('message', ''))}"
+                )
+        if seg.self_correction_errors:
+            parts.append("\n--- Self-Correction Audit Errors ---")
+            for err in seg.self_correction_errors:
+                parts.append(
+                    f"  [{err.get('type', '?')}] (severity={err.get('severity', '?')}) "
+                    f"{err.get('description', '')}"
+                )
+        if seg.feedback:
+            parts.append(f"\n--- Checker Feedback ---\n{seg.feedback}")
+        if seg.verification_detail:
+            parts.append(f"\n--- Verification ---\n{seg.verification_detail}")
+        code_excerpt = self._code_excerpt(seg.final_code or seg.final_output)
+        if code_excerpt:
+            parts.append(f"\n--- Relevant Code Excerpt ---\n{code_excerpt}")
+        return "\n".join(parts)
+
+    @staticmethod
+    def _code_excerpt(text: str, head_chars: int = 1400, tail_chars: int = 400) -> str:
+        if not text:
+            return ""
+        compact = text.strip()
+        if len(compact) <= head_chars + tail_chars:
+            return compact
+        return compact[:head_chars] + "\n...\n" + compact[-tail_chars:]
+
+    def _hydrate_experience(
+        self,
+        exp: Experience,
+        seg: Optional[TaskSegment],
+    ) -> None:
+        if seg and not exp.task_id:
+            exp.task_id = seg.task_id
+        if exp.evidence and not exp.evidence_list:
+            exp.evidence_list = [exp.evidence]
+        if exp.confidence is not None:
+            try:
+                exp.confidence = max(0.0, min(float(exp.confidence), 1.0))
+            except (TypeError, ValueError):
+                exp.confidence = None
+        exp.experience_type = self._normalize_experience_type(exp.experience_type, exp)
+        exp.root_cause_type = self._normalize_root_cause_type(exp.root_cause_type, exp)
+        exp.task_scope = self._normalize_task_scope(exp.task_scope, exp)
+        if exp.confidence is None:
+            exp.confidence = 0.8 if exp.evidence else 0.5
+        if exp.canonical is None:
+            exp.canonical = True
+
+    @staticmethod
+    def _normalize_experience_type(raw: Optional[str], exp: Experience) -> Optional[str]:
+        normalized = str(raw or "").strip().lower()
+        alias_map = {
+            "specification_compliance": "spec_compliance",
+            "specification compliance": "spec_compliance",
+            "interface_compliance": "spec_compliance",
+            "functional": "functional_bug_fix",
+            "functional_logic": "functional_bug_fix",
+            "functional logic": "functional_bug_fix",
+            "implementation pattern": "implementation_pattern",
+        }
+        if normalized in alias_map:
+            return alias_map[normalized]
+        if normalized:
+            return normalized
+
+        category = str(exp.category or "").strip().lower()
+        combined = " ".join(
+            filter(None, [exp.problem or "", exp.solution or "", exp.id or "", category])
+        ).lower()
+        if "interface" in category or "spec" in category:
+            return "spec_compliance"
+        if any(token in combined for token in ("instantiate", "pattern", "architecture", "concatenation")):
+            return "implementation_pattern"
+        if any(token in category for token in ("language compliance", "verification", "process")):
+            return "style_or_portability"
+        return "functional_bug_fix"
+
+    @staticmethod
+    def _normalize_root_cause_type(raw: Optional[str], exp: Experience) -> Optional[str]:
+        normalized = str(raw or "").strip().lower().replace(" ", "_")
+        if normalized:
+            return normalized
+
+        combined = " ".join(filter(None, [exp.problem or "", exp.solution or "", exp.id or ""])).lower()
+        keyword_map = [
+            ("reset", "reset"),
+            ("width", "width"),
+            ("sign", "signedness"),
+            ("interface", "interface"),
+            ("port", "interface"),
+            ("fsm", "fsm"),
+            ("state", "fsm"),
+            ("cdc", "cdc"),
+            ("clock", "timing"),
+            ("timing", "timing"),
+            ("parameter", "parameterization"),
+            ("handshake", "handshake"),
+            ("arith", "arithmetic"),
+            ("divide", "arithmetic"),
+            ("overflow", "arithmetic"),
+            ("syntax", "syntax"),
+            ("compile", "syntax"),
+            ("arch", "architecture"),
+        ]
+        for keyword, cause in keyword_map:
+            if keyword in combined:
+                return cause
+        return "general_logic"
+
+    @staticmethod
+    def _normalize_task_scope(raw: Optional[str], exp: Experience) -> Optional[str]:
+        normalized = str(raw or "").strip().lower()
+        if normalized in {"task_specific", "cross_task"}:
+            return normalized
+
+        task_id = str(exp.task_id or "").strip().lower()
+        if not task_id:
+            return "cross_task"
+        if any(sep in task_id for sep in ",;/ "):
+            return "cross_task"
+        return "task_specific"
+
+    @staticmethod
+    def _safe_float(raw: Optional[str]) -> Optional[float]:
+        try:
+            if raw in (None, ""):
+                return None
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
 
     def extract_from_files(self, log_files: List[str]) -> Dict[str, List[Experience]]:
         """从多个日志文件提取经验"""

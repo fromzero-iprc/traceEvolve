@@ -17,6 +17,13 @@ class LLMConfig:
     temperature: float = 0.7
     max_tokens: int = 16384
 
+    def __post_init__(self):
+        # Ark endpoint currently rejects max_tokens > 32768.
+        # Keep this clamp centralized so callers using from_env/direct ctor are both safe.
+        if self.max_tokens <= 0:
+            self.max_tokens = 16384
+        self.max_tokens = min(self.max_tokens, 32768)
+
     @classmethod
     def from_env(cls, prefix: str = "LLM") -> "LLMConfig":
         """从环境变量加载配置"""
@@ -25,7 +32,7 @@ class LLMConfig:
             api_base=os.getenv(f"{prefix}_API_BASE", ""),
             model=os.getenv(f"{prefix}_MODEL", "gpt-4"),
             temperature=float(os.getenv(f"{prefix}_TEMPERATURE", "0.7")),
-            max_tokens=int(os.getenv(f"{prefix}_MAX_TOKENS", "40960")),
+            max_tokens=int(os.getenv(f"{prefix}_MAX_TOKENS", "16384")),
         )
 
 
@@ -52,7 +59,7 @@ class EvolveConfig:
 
 
 # 提示模板 - 英文版本（默认）
-EXPERIENCE_EXTRACTION_PROMPT = """You are an expert at extracting reusable Verilog benchmark lessons from agent execution logs.
+EXPERIENCE_EXTRACTION_PROMPT = """You are an expert at distilling reusable Verilog benchmark lessons from agent execution logs.
 
 The input may contain:
 - raw task prompts
@@ -61,23 +68,28 @@ The input may contain:
 - iterative repair history
 - a parsed structured summary generated from the log
 
-Your job is to extract high-value lessons (no more than {max_experiences} items) that improve future single-file Verilog benchmark generation.
+Your job is to extract a SMALL number of high-value canonical lessons (no more than {max_experiences} items) that improve future single-file Verilog benchmark generation.
 
 Prioritize lessons in this order:
 1. Interface/specification mistakes: wrong module name, wrong ports, wrong widths, wrong reset behavior
 2. Functional design mistakes: FSM bugs, FIFO full/empty logic, signed/unsigned issues, counter overflow, CDC, pipeline staging
-3. Output-format mistakes: malformed YAML/JSON, bad fenced-code structure, extra narrative around final code
-4. Process improvements only when they directly prevent benchmark failures
+3. Concrete implementation patterns that directly fix recurring benchmark failures
 
 What to avoid:
 - Do NOT extract generic repo-management advice unless the log clearly proves it caused the failure
 - Do NOT extract lessons about compiling multiple Verilog files together unless the benchmark truly depends on multiple source files
 - Do NOT produce vague lessons like 'be careful' or 'check syntax'
+- Do NOT output style, readability, or review-comment advice as main experiences
+- Do NOT output process reminders like 'always verify' or 'clarify spec' as main experiences
 - Do NOT output Chinese; all fields and all text must be English
 
 When a parsed structured summary is present, trust it more than noisy raw log fragments.
 Prefer benchmark-specific lessons over generic advice.
-If multiple failures share one root cause, produce one stronger generalized lesson instead of duplicates.
+If multiple failures share one root cause, produce one stronger canonical lesson instead of duplicates.
+Only emit experiences that have:
+- a concrete root cause
+- a concrete fix action
+- direct evidence from the log
 
 Examples of good lessons:
 - problem: Module name does not exactly match the required top module name
@@ -98,6 +110,7 @@ Output requirements:
 - Use short, concrete, reusable one-line problem and solution fields
 - Keep category names in English and reasonably normalized
 - Prefer ids in lowercase snake_case
+- Only emit these experience_type values: spec_compliance, functional_bug_fix, implementation_pattern
 
 ```json
 {{
@@ -105,10 +118,14 @@ Output requirements:
     {{
       "id": "unique_id",
       "category": "category name",
+      "experience_type": "spec_compliance | functional_bug_fix | implementation_pattern",
+      "root_cause_type": "reset | width | interface | arithmetic | fsm | cdc | timing | syntax | parameterization | handshake | signedness | architecture | general_logic",
+      "task_scope": "task_specific | cross_task",
       "problem": "one line problem description",
       "solution": "one line solution",
-      "task_type": "optional",
-      "importance": "high/medium/low"
+      "evidence": "short direct quote or precise reference from the log",
+      "importance": "high/medium/low",
+      "confidence": 0.0
     }}
   ]
 }}
@@ -157,13 +174,13 @@ EXPERIENCE_EXTRACTION_PROMPT_CN = """你是一个 Verilog 编程专家。请分�
 - 如果这个日志最终生成出了正确代码，那么尤其要关注日志中的迭代经验，因为说明这种迭代最终能导出正确的结果
 """
 
-SEGMENT_EXTRACTION_PROMPT = """You are an expert at extracting reusable Verilog benchmark lessons from a SINGLE task's execution record.
+SEGMENT_EXTRACTION_PROMPT = """You are an expert at distilling reusable Verilog benchmark lessons from a SINGLE task's execution record.
 
 Below is the structured execution record of one Verilog benchmark task.
 It contains the original specification, checker errors, self-correction audit results,
 checker feedback, verification outcomes, and the final generated Verilog code.
 
-Your job: extract 0 to {max_experiences} high-value, concrete, reusable lessons from THIS task.
+Your job: extract 0 to {max_experiences} high-value canonical lessons from THIS task.
 
 CRITICAL RULES:
 - If this task passed cleanly with no errors, warnings, or interesting patterns, output 0 experiences.
@@ -174,12 +191,22 @@ CRITICAL RULES:
 - Each lesson must be specific enough that a Verilog code generator can act on it.
 - All text must be in English.
 - Prefer lowercase_snake_case for ids.
+- Only emit lessons whose experience_type is one of:
+  - spec_compliance
+  - functional_bug_fix
+  - implementation_pattern
+- Do NOT emit style_or_portability, meta_process, reviewer reminders, or generic verification advice as experiences.
+- If two observations share the same root cause, output one stronger canonical lesson instead of multiple variants.
 
 Prioritize:
 1. Specification/interface mismatches (wrong module name, wrong ports, wrong widths, wrong reset polarity)
 2. Functional logic bugs (FSM errors, FIFO logic, signed/unsigned, counter overflow, CDC, pipeline)
-3. Warnings or risks flagged by self-correction audit even if the task ultimately passed
-4. Output format issues (malformed code blocks, extra text inside fenced code)
+3. Concrete implementation patterns that directly repair a recurring failure mode
+
+Every experience must answer all of these:
+- What is the minimal root cause?
+- What exact code action fixes it?
+- What evidence proves this lesson?
 
 Task execution record:
 ```
@@ -193,10 +220,14 @@ Output valid JSON only:
     {{{{
       "id": "lowercase_snake_case_id",
       "category": "category name",
+      "experience_type": "spec_compliance | functional_bug_fix | implementation_pattern",
+      "root_cause_type": "reset | width | interface | arithmetic | fsm | cdc | timing | syntax | parameterization | handshake | signedness | architecture | general_logic",
+      "task_scope": "task_specific | cross_task",
       "problem": "one-line problem description",
       "solution": "one-line actionable solution",
       "evidence": "short quote from the task data proving this lesson",
       "importance": "high/medium/low",
+      "confidence": 0.0,
       "task_id": "{task_id}"
     }}}}
   ]
@@ -206,7 +237,7 @@ Output valid JSON only:
 
 SINGLE_EXPERIENCE_MERGE_PROMPT = """You are an experience-pool curator for Verilog benchmark lessons.
 
-Candidate existing experiences (same category, similar problem):
+Candidate existing experiences (same task/category or semantic overlap):
 ```json
 {existing_candidates}
 ```
@@ -223,7 +254,9 @@ Decide ONE action:
 4. SKIP - redundant with existing
 
 Rules:
+- Prefer MERGE over INSERT when the new experience shares the same root cause / task cluster and mainly adds evidence or tighter wording.
 - When the new experience is clearly more specific, more actionable, and better evidenced than an older generic one in the same cluster, prefer REPLACE or MERGE over SKIP.
+- Prefer spec_compliance over generic advice, and prefer direct pass-linked evidence over intermediate hints.
 - Output valid JSON only. Return exactly one operation.
 
 ```json
@@ -235,11 +268,15 @@ Rules:
       "new_experience": {{
         "id": "new_id",
         "category": "category",
+        "experience_type": "spec_compliance | functional_bug_fix | implementation_pattern",
+        "root_cause_type": "reset | width | interface | arithmetic | fsm | cdc | timing | syntax | parameterization | handshake | signedness | architecture | general_logic",
+        "task_scope": "task_specific | cross_task",
         "problem": "problem description",
         "solution": "solution description",
         "evidence": "optional",
         "task_id": "optional",
-        "importance": "high/medium/low"
+        "importance": "high/medium/low",
+        "confidence": 0.0
       }},
       "reason": "short explanation"
     }}
@@ -277,6 +314,8 @@ Rules:
 - Prefer normalized English categories
 - Do not keep repo-specific or low-signal experiences when a more general benchmark lesson exists
 - When a new experience is clearly more specific, more actionable, and better evidenced than an older generic one in the same lesson cluster, prefer REPLACE or MERGE over SKIP
+- Prefer MERGE over INSERT when the new item belongs to an existing task/root-cause cluster and mainly contributes evidence or canonical wording
+- Prefer spec_compliance and functional_bug_fix over style/process advice
 
 ```json
 {{
@@ -287,12 +326,16 @@ Rules:
       "new_experience": {{
         "id": "new_id",
         "category": "category",
+        "experience_type": "spec_compliance | functional_bug_fix | implementation_pattern",
+        "root_cause_type": "reset | width | interface | arithmetic | fsm | cdc | timing | syntax | parameterization | handshake | signedness | architecture | general_logic",
+        "task_scope": "task_specific | cross_task",
         "problem": "problem description",
         "solution": "solution description",
         "code_pattern": "optional short pattern",
         "importance": "high/medium/low",
         "evidence": "optional short quote",
-        "task_id": "optional task id"
+        "task_id": "optional task id",
+        "confidence": 0.0
       }},
       "reason": "short English explanation"
     }}

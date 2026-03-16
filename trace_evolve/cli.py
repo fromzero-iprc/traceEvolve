@@ -30,6 +30,7 @@ from typing import List
 
 from .config import EvolveConfig, LLMConfig
 from .pipeline import EvolvePipeline
+from .pool_splitter import split_pool_file
 
 
 def find_log_files(directory: str, pattern: str = "*.log") -> List[str]:
@@ -87,8 +88,24 @@ def parse_args():
     parser.add_argument(
         "--pool",
         "-p",
-        default="experience_pool.json",
-        help="经验池文件路径 (默认: experience_pool.json)",
+        default=None,
+        help="兼容参数：单一经验池路径。若未传入，则按 --pool-target 选择 core/extended。",
+    )
+    parser.add_argument(
+        "--core-pool",
+        default="experience_pool_core.json",
+        help="core 经验池路径 (默认: experience_pool_core.json)",
+    )
+    parser.add_argument(
+        "--extended-pool",
+        default="experience_pool_extended.json",
+        help="extended 经验池路径 (默认: experience_pool_extended.json)",
+    )
+    parser.add_argument(
+        "--pool-target",
+        choices=["core", "extended"],
+        default="extended",
+        help="默认写入目标池 (默认: extended)",
     )
     parser.add_argument(
         "--intermediate-dir",
@@ -149,6 +166,11 @@ def parse_args():
         help="从 spool 目录读取候选经验并单独合并到经验池",
     )
     parser.add_argument(
+        "--split-pool",
+        action="store_true",
+        help="将单一经验池按规则拆分为 core/extended 两个池",
+    )
+    parser.add_argument(
         "--output",
         "-o",
         default="experiences_for_icl.txt",
@@ -170,6 +192,35 @@ def parse_args():
 def main():
     args = parse_args()
 
+    def _resolve_pool_path(default_target: str = "extended") -> str:
+        if args.pool:
+            return args.pool
+        if default_target == "core":
+            return args.core_pool
+        return args.extended_pool
+
+    if args.split_pool:
+        if not args.pool:
+            print("错误：--split-pool 需要提供 --pool 作为输入池文件。")
+            sys.exit(1)
+        split_result = split_pool_file(
+            input_pool=args.pool,
+            core_pool=args.core_pool,
+            extended_pool=args.extended_pool,
+        )
+        print("\n" + "=" * 60)
+        print("经验池拆分完成")
+        print("=" * 60)
+        print(f"输入池：{split_result['input_pool']} ({split_result['input_size']})")
+        print(f"Core：{split_result['core_pool']} ({split_result['core_size']})")
+        print(
+            f"Extended：{split_result['extended_pool']} ({split_result['extended_size']})"
+        )
+        print("分类原因统计：")
+        for reason, count in split_result["reasons"].items():
+            print(f"  - {reason}: {count}")
+        return
+
     llm_config = LLMConfig(
         api_key=args.api_key,
         api_base=args.api_base,
@@ -179,7 +230,7 @@ def main():
     config = EvolveConfig(
         extractor_llm=llm_config,
         manager_llm=llm_config,
-        experience_pool_path=args.pool,
+        experience_pool_path=_resolve_pool_path(args.pool_target),
         max_experiences_per_log=args.max_experiences,
         max_pool_size=args.max_pool_size,
         save_intermediate=not args.no_intermediate,
@@ -189,14 +240,28 @@ def main():
     pipeline = EvolvePipeline(config)
 
     if args.export:
-        if not Path(args.pool).exists():
-            print(f"错误：经验池文件不存在：{args.pool}")
+        export_pool = _resolve_pool_path("core")
+        if not Path(export_pool).exists():
+            print(f"错误：经验池文件不存在：{export_pool}")
             sys.exit(1)
 
-        pipeline.export_experiences_for_icl(
+        export_config = EvolveConfig(
+            extractor_llm=llm_config,
+            manager_llm=llm_config,
+            experience_pool_path=export_pool,
+            max_experiences_per_log=args.max_experiences,
+            max_pool_size=args.max_pool_size,
+            save_intermediate=not args.no_intermediate,
+            intermediate_dir=args.intermediate_dir,
+        )
+        export_pipeline = EvolvePipeline(export_config)
+
+        export_pipeline.export_experiences_for_icl(
             output_path=args.output, max_count=args.export_count
         )
-        print(f"\n已导出 {args.export_count} 条经验到 {args.output}")
+        print(
+            f"\n已从 {export_pool} 导出 {args.export_count} 条经验到 {args.output}"
+        )
         return
 
     if args.merge_spool:
@@ -204,6 +269,7 @@ def main():
         print("\n" + "=" * 60)
         print("Spool 合并完成!")
         print("=" * 60)
+        print(f"目标经验池：{config.experience_pool_path}")
         print(f"Spool 文件数：{len(results['spool_files'])}")
         print(f"读取经验数：{results['loaded_experiences']}")
         print(f"无效行数：{results['invalid_lines']}")

@@ -125,31 +125,21 @@ class ExperiencePool:
 
     def _normalize_and_deduplicate_experiences(self) -> None:
         """
-        对整个经验池做一次 category 归一化 + 全局去重。
-        归一化依赖 postprocessor 的 _CATEGORY_ALIASES；
-        去重逻辑重用 ExperiencePostProcessor._dedup_group。
+        对整个经验池做一次结构归一化 + 全局去重。
         """
         if not self.experiences:
             return
 
-        # 1) 归一化 category
-        ExperiencePostProcessor.normalize_pool(self)
-
-        # 2) 按归一化后 category 分组，全局去重
         pp = ExperiencePostProcessor()
-        groups: Dict[str, List[Experience]] = {}
+        normalized = []
         for exp in self.get_all():
-            groups.setdefault(exp.category, []).append(exp)
+            normalized.append(pp._normalize(exp))
 
+        deduped = pp.deduplicate(normalized)
         new_experiences: Dict[str, Experience] = {}
-        removed = 0
-        for cat, group in groups.items():
-            deduped = pp._dedup_group(group)
-            # 可能存在不同 id 但高度相似的经验，这里保留 _dedup_group 返回的子集
-            # 如果 id 冲突，则后者覆盖前者（通常 importance 更低的是被丢弃的一侧）
-            removed += len(group) - len(deduped)
-            for exp in deduped:
-                new_experiences[exp.id] = exp
+        removed = len(self.experiences) - len(deduped)
+        for exp in deduped:
+            new_experiences[exp.id] = exp
 
         if removed > 0:
             print(
@@ -351,59 +341,346 @@ class ExperienceManager:
             if missing:
                 print(
                     f"[Conflict] {op.action.value} targets {missing} already gone, "
-                    f"downgrading to INSERT for {op.new_experience.id if op.new_experience else '?'}"
+                    f"downgrading to SKIP for {op.new_experience.id if op.new_experience else '?'}"
                 )
                 return Operation(
-                    action=OperationType.INSERT,
+                    action=OperationType.SKIP,
                     target_ids=[],
-                    new_experience=op.new_experience,
-                    reason=f"Conflict: original {op.action.value} targets {missing} removed by prior op",
+                    new_experience=None,
+                    reason=(
+                        f"Conflict: original {op.action.value} targets {missing} "
+                        "already removed by prior op"
+                    ),
                 )
         return op
 
-    def _find_candidates(self, new_exp: Experience, top_k: int = 5) -> List[Experience]:
-        """按 category 过滤 + problem Jaccard 相似度取 top-k 旧候选。"""
-        same_cat = [
-            e
-            for e in self.pool.get_all()
-            if e.category == new_exp.category and e.id != new_exp.id
-        ]
-        if not same_cat:
+    @staticmethod
+    def _same_task(a: Experience, b: Experience) -> bool:
+        task_a_raw = str(a.task_id or "").strip().lower()
+        task_b_raw = str(b.task_id or "").strip().lower()
+        if not task_a_raw or not task_b_raw:
+            return False
+
+        split_pattern = r"[,;/\s]+"
+        task_a = {tok for tok in re.split(split_pattern, task_a_raw) if tok}
+        task_b = {tok for tok in re.split(split_pattern, task_b_raw) if tok}
+        if not task_a or not task_b:
+            return False
+        return bool(task_a & task_b)
+
+    @staticmethod
+    def _same_category(a: Experience, b: Experience) -> bool:
+        return str(a.category or "").strip() == str(b.category or "").strip()
+
+    @staticmethod
+    def _same_root_cause(a: Experience, b: Experience) -> bool:
+        return str(a.root_cause_type or "").strip() == str(b.root_cause_type or "").strip()
+
+    @staticmethod
+    def _same_experience_type(a: Experience, b: Experience) -> bool:
+        return str(a.experience_type or "").strip() == str(b.experience_type or "").strip()
+
+    def _same_cluster(self, a: Experience, b: Experience) -> bool:
+        return self._same_root_cause(a, b) and (
+            self._same_task(a, b)
+            or self._same_experience_type(a, b)
+            or self._combined_similarity(a, b) >= 0.40
+        )
+
+    def _combined_similarity(self, new_exp: Experience, old_exp: Experience) -> float:
+        problem_sim = calculate_similarity(new_exp.problem, old_exp.problem)
+        solution_sim = calculate_similarity(new_exp.solution, old_exp.solution)
+        evidence_sim = 0.0
+        if new_exp.evidence and old_exp.evidence:
+            evidence_sim = calculate_similarity(new_exp.evidence, old_exp.evidence)
+
+        score = problem_sim * 0.52 + solution_sim * 0.33 + evidence_sim * 0.15
+        if self._same_task(new_exp, old_exp):
+            score += 0.12
+        if self._same_root_cause(new_exp, old_exp):
+            score += 0.10
+        if self._same_experience_type(new_exp, old_exp):
+            score += 0.06
+        if self._same_category(new_exp, old_exp):
+            score += 0.08
+        return min(1.0, score)
+
+    def _find_candidates(self, new_exp: Experience, top_k: int = 12) -> List[Experience]:
+        """
+        候选召回（严格 INSERT 前置）：
+        - 同 task_id / root_cause / experience_type 优先
+        - 语义相似（problem+solution+evidence）补充
+        """
+        all_existing = [e for e in self.pool.get_all() if e.id != new_exp.id]
+        if not all_existing:
             return []
 
-        scored = [
-            (e, calculate_similarity(new_exp.problem, e.problem)) for e in same_cat
-        ]
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [e for e, _ in scored[:top_k]]
+        scored: List[Tuple[Experience, float, bool, bool, float]] = []
+        for old_exp in all_existing:
+            sim = self._combined_similarity(new_exp, old_exp)
+            same_task = self._same_task(new_exp, old_exp)
+            same_cluster = self._same_cluster(new_exp, old_exp)
+            if not (same_task or same_cluster or sim >= 0.26):
+                continue
+            scored.append(
+                (old_exp, sim, same_task, same_cluster, quality_score(old_exp))
+            )
+
+        if not scored:
+            for old_exp in all_existing:
+                sim = self._combined_similarity(new_exp, old_exp)
+                if sim >= 0.20:
+                    scored.append(
+                        (
+                            old_exp,
+                            sim,
+                            self._same_task(new_exp, old_exp),
+                            self._same_cluster(new_exp, old_exp),
+                            quality_score(old_exp),
+                        )
+                    )
+
+        if not scored:
+            return []
+
+        scored.sort(
+            key=lambda item: (
+                item[2],  # same_task
+                item[3],  # same_cluster
+                item[1],  # similarity
+                item[4],  # candidate quality
+            ),
+            reverse=True,
+        )
+        return [item[0] for item in scored[:top_k]]
+
+    def _strict_fallback_operation(
+        self,
+        new_exp: Experience,
+        best_cand: Optional[Experience],
+        sim: float,
+        q_new: float,
+        q_old: float,
+        reason_prefix: str,
+    ) -> Operation:
+        has_task = bool(str(new_exp.task_id or "").strip())
+        if str(new_exp.experience_type or "").strip() not in {
+            "spec_compliance",
+            "functional_bug_fix",
+            "implementation_pattern",
+        }:
+            return Operation(
+                action=OperationType.SKIP,
+                target_ids=[],
+                new_experience=None,
+                reason=f"{reason_prefix}: non-main experience type {new_exp.experience_type}",
+            )
+        if best_cand is None:
+            if q_new <= 2 and not has_task:
+                return Operation(
+                    action=OperationType.SKIP,
+                    target_ids=[],
+                    new_experience=None,
+                    reason=f"{reason_prefix}: low-signal experience without task_id",
+                )
+            return Operation(
+                action=OperationType.INSERT,
+                target_ids=[],
+                new_experience=new_exp,
+                reason=f"{reason_prefix}: no candidate found",
+            )
+
+        if self._same_cluster(new_exp, best_cand) and sim >= 0.34:
+            merged = self._merge_experience_pair(best_cand, new_exp)
+            if not self._passes_merge_quality_gate(merged):
+                return Operation(
+                    action=OperationType.SKIP,
+                    target_ids=[],
+                    new_experience=None,
+                    reason=f"{reason_prefix}: rejected speculative or low-signal merged candidate",
+                )
+            return Operation(
+                action=OperationType.MERGE,
+                target_ids=[best_cand.id],
+                new_experience=merged,
+                reason=(
+                    f"{reason_prefix}: merge-first for same cluster "
+                    f"(sim={sim:.2f}, new={q_new:.1f}, old={q_old:.1f})"
+                ),
+            )
+
+        if sim >= 0.45:
+            if q_new >= q_old + 2:
+                return Operation(
+                    action=OperationType.REPLACE,
+                    target_ids=[best_cand.id],
+                    new_experience=new_exp,
+                    reason=(
+                        f"{reason_prefix}: overlap candidate exists, replace by quality "
+                        f"(new={q_new:.1f}, old={q_old:.1f})"
+                    ),
+                )
+            return Operation(
+                action=OperationType.SKIP,
+                target_ids=[],
+                new_experience=None,
+                reason=(
+                    f"{reason_prefix}: overlap candidate exists "
+                    f"(sim={sim:.2f}, new={q_new:.1f}, old={q_old:.1f})"
+                ),
+            )
+
+        if q_new <= 1 and not has_task:
+            return Operation(
+                action=OperationType.SKIP,
+                target_ids=[],
+                new_experience=None,
+                reason=f"{reason_prefix}: very low quality and no task linkage",
+            )
+
+        return Operation(
+            action=OperationType.INSERT,
+            target_ids=[],
+            new_experience=new_exp,
+            reason=f"{reason_prefix}: low overlap candidate",
+        )
+
+    def _sanitize_llm_operation(
+        self,
+        op: Operation,
+        new_exp: Experience,
+        best_cand: Optional[Experience],
+        sim: float,
+        q_new: float,
+        q_old: float,
+    ) -> Operation:
+        if op.action in {OperationType.MERGE, OperationType.REPLACE} and (
+            not op.new_experience or not op.target_ids
+        ):
+            return self._strict_fallback_operation(
+                new_exp=new_exp,
+                best_cand=best_cand,
+                sim=sim,
+                q_new=q_new,
+                q_old=q_old,
+                reason_prefix="InvalidLLMOpFallback",
+            )
+        repaired_new_exp = None
+        if op.new_experience:
+            repaired_new_exp = self._repair_proposed_experience(
+                op.new_experience, new_exp, best_cand
+            )
+            if not self._passes_merge_quality_gate(repaired_new_exp):
+                return Operation(
+                    action=OperationType.SKIP,
+                    target_ids=[],
+                    new_experience=None,
+                    reason=(
+                        "Rejected after merge-quality gate: "
+                        f"{repaired_new_exp.id or new_exp.id}"
+                    ),
+                )
+            op = Operation(
+                action=op.action,
+                target_ids=op.target_ids,
+                new_experience=repaired_new_exp,
+                reason=op.reason,
+            )
+        if op.action != OperationType.INSERT:
+            return op
+        return self._strict_fallback_operation(
+            new_exp=repaired_new_exp or new_exp,
+            best_cand=best_cand,
+            sim=sim,
+            q_new=q_new,
+            q_old=q_old,
+            reason_prefix="InsertGuard",
+        )
 
     def _merge_single(self, new_exp: Experience, batch_id: str) -> Optional[Operation]:
         """
         对单条新经验做合并决策：无候选则 INSERT；有候选则规则预判或 LLM。
         """
-        candidates = self._find_candidates(new_exp, top_k=5)
+        candidates = self._find_candidates(new_exp, top_k=12)
+        q_new = quality_score(new_exp)
 
         if not candidates:
-            return Operation(
-                action=OperationType.INSERT,
-                target_ids=[],
-                new_experience=new_exp,
-                reason="No similar candidate in pool",
+            return self._strict_fallback_operation(
+                new_exp=new_exp,
+                best_cand=None,
+                sim=0.0,
+                q_new=q_new,
+                q_old=0.0,
+                reason_prefix="NoCandidate",
             )
 
-        # 规则预判：新经验明显优于某旧候选则直接 REPLACE
+        # 规则预判：高重叠场景优先 REPLACE / SKIP，减少 INSERT 噪声。
         best_cand = candidates[0]
-        sim = calculate_similarity(new_exp.problem, best_cand.problem)
-        if sim >= 0.5:
-            q_new = quality_score(new_exp)
-            q_old = quality_score(best_cand)
-            if q_new - q_old >= 3:
+        q_old = quality_score(best_cand)
+        sim = self._combined_similarity(new_exp, best_cand)
+        same_task = self._same_task(new_exp, best_cand)
+        same_cluster = self._same_cluster(new_exp, best_cand)
+        if same_cluster and sim >= 0.48:
+            merged = self._merge_experience_pair(best_cand, new_exp)
+            if not self._passes_merge_quality_gate(merged):
+                return Operation(
+                    action=OperationType.SKIP,
+                    target_ids=[],
+                    new_experience=None,
+                    reason=(
+                        f"Rule SKIP: speculative or low-signal same-cluster merge "
+                        f"with {best_cand.id}"
+                    ),
+                )
+            if q_new >= q_old + 2:
                 return Operation(
                     action=OperationType.REPLACE,
                     target_ids=[best_cand.id],
-                    new_experience=new_exp,
-                    reason=f"Rule REPLACE: quality_score new={q_new:.1f} old={q_old:.1f}",
+                    new_experience=merged,
+                    reason=(
+                        f"Rule REPLACE: stronger same-cluster candidate {best_cand.id} "
+                        f"(sim={sim:.2f}, new={q_new:.1f}, old={q_old:.1f})"
+                    ),
                 )
+            return Operation(
+                action=OperationType.MERGE,
+                target_ids=[best_cand.id],
+                new_experience=merged,
+                reason=(
+                    f"Rule MERGE: same-cluster consolidation with {best_cand.id} "
+                    f"(sim={sim:.2f}, new={q_new:.1f}, old={q_old:.1f})"
+                ),
+            )
+        if sim >= 0.82 and q_new <= q_old + 1:
+            return Operation(
+                action=OperationType.SKIP,
+                target_ids=[],
+                new_experience=None,
+                reason=(
+                    f"Rule SKIP: near-duplicate with {best_cand.id} "
+                    f"(sim={sim:.2f}, new={q_new:.1f}, old={q_old:.1f})"
+                ),
+            )
+        if (sim >= 0.68 or (same_task and sim >= 0.55)) and q_new >= q_old + 2:
+            return Operation(
+                action=OperationType.REPLACE,
+                target_ids=[best_cand.id],
+                new_experience=new_exp,
+                reason=(
+                    f"Rule REPLACE: stronger overlap candidate {best_cand.id} "
+                    f"(sim={sim:.2f}, new={q_new:.1f}, old={q_old:.1f})"
+                ),
+            )
+        if sim >= 0.60 and q_new <= q_old:
+            return Operation(
+                action=OperationType.SKIP,
+                target_ids=[],
+                new_experience=None,
+                reason=(
+                    f"Rule SKIP: overlap candidate {best_cand.id} not improved "
+                    f"(sim={sim:.2f}, new={q_new:.1f}, old={q_old:.1f})"
+                ),
+            )
 
         # LLM 局部 merge
         prompt = SINGLE_EXPERIENCE_MERGE_PROMPT.format(
@@ -416,21 +693,29 @@ class ExperienceManager:
             response = self.llm_client.call(prompt)
             ops = self._parse_merge_response(response)
             if ops:
-                return ops[0]
-            # 解析成功但无操作，fallback INSERT
-            return Operation(
-                action=OperationType.INSERT,
-                target_ids=[],
-                new_experience=new_exp,
-                reason="LLM returned no operation, fallback INSERT",
+                return self._sanitize_llm_operation(
+                    ops[0], new_exp, best_cand, sim, q_new, q_old
+                )
+            return self._strict_fallback_operation(
+                new_exp=new_exp,
+                best_cand=best_cand,
+                sim=sim,
+                q_new=q_new,
+                q_old=q_old,
+                reason_prefix="LLMEmptyFallback",
             )
         except Exception as e:
-            print(f"[Merge] LLM parse failed for {new_exp.id}: {e}, fallback INSERT")
-            return Operation(
-                action=OperationType.INSERT,
-                target_ids=[],
-                new_experience=new_exp,
-                reason=f"Fallback INSERT after LLM error: {e}",
+            print(
+                f"[Merge] LLM parse failed for {new_exp.id}: {e}, "
+                "fallback strict decision"
+            )
+            return self._strict_fallback_operation(
+                new_exp=new_exp,
+                best_cand=best_cand,
+                sim=sim,
+                q_new=q_new,
+                q_old=q_old,
+                reason_prefix=f"LLMErrorFallback({type(e).__name__})",
             )
 
     def _parse_merge_response(self, response: str) -> List[Operation]:
@@ -474,6 +759,114 @@ class ExperienceManager:
             if first_newline != -1 and last_fence != -1 and last_fence > first_newline:
                 return stripped[first_newline + 1 : last_fence]
         return stripped
+
+    def _merge_experience_pair(self, old_exp: Experience, new_exp: Experience) -> Experience:
+        if quality_score(new_exp) > quality_score(old_exp):
+            primary = new_exp
+            secondary = old_exp
+        else:
+            primary = old_exp
+            secondary = new_exp
+
+        evidence_list: List[str] = []
+        for item in (primary.evidence_list or []) + ([primary.evidence] if primary.evidence else []):
+            if item and item not in evidence_list:
+                evidence_list.append(item)
+        for item in (secondary.evidence_list or []) + ([secondary.evidence] if secondary.evidence else []):
+            if item and item not in evidence_list:
+                evidence_list.append(item)
+
+        merged_from: List[str] = []
+        for item in (primary.merged_from or []) + [secondary.id] + (secondary.merged_from or []):
+            if item and item not in merged_from and item != primary.id:
+                merged_from.append(item)
+
+        merged = Experience.from_dict(primary.to_dict())
+        merged.evidence_list = evidence_list
+        merged.merged_from = merged_from
+        merged.confidence = max(primary.confidence or 0.0, secondary.confidence or 0.0)
+        merged.importance = self._higher_importance(primary.importance, secondary.importance)
+        if not merged.evidence and secondary.evidence:
+            merged.evidence = secondary.evidence
+        if not merged.task_id:
+            merged.task_id = old_exp.task_id or new_exp.task_id
+        if not merged.experience_type:
+            merged.experience_type = old_exp.experience_type or new_exp.experience_type
+        if not merged.root_cause_type:
+            merged.root_cause_type = old_exp.root_cause_type or new_exp.root_cause_type
+        if not merged.task_scope:
+            merged.task_scope = old_exp.task_scope or new_exp.task_scope
+        return self._repair_proposed_experience(merged, new_exp, old_exp)
+
+    @staticmethod
+    def _higher_importance(a: str, b: str) -> str:
+        rank = {"high": 3, "medium": 2, "low": 1}
+        return a if rank.get(a, 1) >= rank.get(b, 1) else b
+
+    def _repair_proposed_experience(
+        self,
+        proposed: Experience,
+        new_exp: Experience,
+        best_cand: Optional[Experience],
+    ) -> Experience:
+        repaired = Experience.from_dict(proposed.to_dict())
+        fallback_task_id = new_exp.task_id or (best_cand.task_id if best_cand else None)
+        fallback_type = new_exp.experience_type or (
+            best_cand.experience_type if best_cand else None
+        )
+        fallback_root = new_exp.root_cause_type or (
+            best_cand.root_cause_type if best_cand else None
+        )
+
+        if not repaired.task_id:
+            repaired.task_id = fallback_task_id
+        if not repaired.experience_type:
+            repaired.experience_type = fallback_type
+        if not repaired.root_cause_type:
+            repaired.root_cause_type = fallback_root
+        if not repaired.evidence:
+            repaired.evidence = new_exp.evidence or (best_cand.evidence if best_cand else None)
+        if repaired.confidence is None:
+            repaired.confidence = max(
+                new_exp.confidence or 0.0,
+                (best_cand.confidence or 0.0) if best_cand else 0.0,
+                repaired.confidence or 0.0,
+            )
+
+        evidence_list: List[str] = []
+        for item in (repaired.evidence_list or []) + ([repaired.evidence] if repaired.evidence else []):
+            if item and item not in evidence_list:
+                evidence_list.append(item)
+        for item in (new_exp.evidence_list or []) + ([new_exp.evidence] if new_exp.evidence else []):
+            if item and item not in evidence_list:
+                evidence_list.append(item)
+        if best_cand:
+            for item in (best_cand.evidence_list or []) + ([best_cand.evidence] if best_cand.evidence else []):
+                if item and item not in evidence_list:
+                    evidence_list.append(item)
+        repaired.evidence_list = evidence_list or None
+
+        merged_from: List[str] = []
+        merged_seed = [best_cand.id] if best_cand else []
+        for item in (repaired.merged_from or []) + [new_exp.id] + (
+            (best_cand.merged_from or []) if best_cand else []
+        ):
+            if item and item not in merged_from and item != repaired.id:
+                merged_from.append(item)
+        for item in merged_seed:
+            if item and item not in merged_from and item != repaired.id:
+                merged_from.append(item)
+        repaired.merged_from = merged_from or None
+
+        repaired = ExperiencePostProcessor()._normalize(repaired)
+        if repaired.task_id and not any(sep in repaired.task_id for sep in ",;/ "):
+            repaired.task_scope = "task_specific"
+        return repaired
+
+    def _passes_merge_quality_gate(self, exp: Experience) -> bool:
+        pp = ExperiencePostProcessor()
+        normalized = pp._normalize(Experience.from_dict(exp.to_dict()))
+        return pp._passes_quality(normalized)
 
     def _execute_operation(self, operation: Operation, batch_id: str):
         """执行单个操作"""
@@ -531,7 +924,13 @@ class ExperienceManager:
 
     def get_experiences_for_prompt(self, max_count: int = 20) -> str:
         """获取经验，用于构建提示词"""
-        experiences = self.pool.get_all()
+        ExperiencePostProcessor.normalize_pool(self.pool)
+        experiences = [
+            exp
+            for exp in self.pool.get_all()
+            if str(exp.experience_type or "").strip()
+            in {"spec_compliance", "functional_bug_fix", "implementation_pattern"}
+        ] or self.pool.get_all()
 
         # 按 quality_score 排序
         experiences.sort(key=lambda x: quality_score(x), reverse=True)
