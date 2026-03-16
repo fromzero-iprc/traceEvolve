@@ -32,7 +32,7 @@ def example_basic_usage():
         api_base=os.getenv("LLM_API_BASE", ""),
         model="gpt-4",
         temperature=0.7,
-        max_tokens=40960,
+        max_tokens=16384,
     )
 
     # 2. 创建经验提取器

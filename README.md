@@ -60,7 +60,8 @@ Process one QiMeng run log and update the pool immediately:
 python3.8 -m trace_evolve.cli \
   --files /path/to/run_20260311_160600.json \
   --qimeng \
-  --pool /path/to/experience_pool.json
+  --pool-target extended \
+  --extended-pool /path/to/experience_pool_extended.json
 ```
 
 Process a directory of QiMeng run logs:
@@ -69,7 +70,8 @@ Process a directory of QiMeng run logs:
 python3.8 -m trace_evolve.cli \
   --dir /path/to/qimeng/logs \
   --qimeng \
-  --pool /path/to/experience_pool.json \
+  --pool-target extended \
+  --extended-pool /path/to/experience_pool_extended.json \
   --batch-size 4 \
   --intermediate-dir intermediate_results
 ```
@@ -102,15 +104,26 @@ python3.8 -m trace_evolve.cli \
 python3.8 -m trace_evolve.cli \
   --merge-spool \
   --spool /path/to/experience_spool \
-  --pool /path/to/experience_pool.json
+  --pool-target extended \
+  --extended-pool /path/to/experience_pool_extended.json
 ```
 
-### 4. Export experiences for ICL
+### 4. Split one legacy pool into core/extended
+
+```bash
+python3.8 -m trace_evolve.cli \
+  --split-pool \
+  --pool /path/to/experience_pool.json \
+  --core-pool /path/to/experience_pool_core.json \
+  --extended-pool /path/to/experience_pool_extended.json
+```
+
+### 5. Export experiences for ICL
 
 ```bash
 python3.8 -m trace_evolve.cli \
   --export \
-  --pool /path/to/experience_pool.json \
+  --core-pool /path/to/experience_pool_core.json \
   --output experiences.txt
 ```
 
