@@ -34,6 +34,7 @@ from .pool_splitter import split_pool_file
 
 
 def find_log_files(directory: str, pattern: str = "*.log") -> List[str]:
+    """查找目录下的所有日志文件"""
     log_dir = Path(directory)
     if not log_dir.exists():
         raise FileNotFoundError(f"目录不存在: {directory}")
