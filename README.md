@@ -66,6 +66,17 @@ export LLM_MODEL="gpt-4"
 
 If you are following the current QiMeng-Agent integration, use `python3.8` when running `traceEvolve` commands.
 
+If you use `create_pipeline_from_env()`, it reads separate prefixes:
+
+```bash
+export EXTRACTOR_LLM_API_KEY="your-api-key"
+export EXTRACTOR_LLM_API_BASE="https://your-compatible-endpoint/v1"
+export EXTRACTOR_LLM_MODEL="gpt-4"
+export MANAGER_LLM_API_KEY="your-api-key"
+export MANAGER_LLM_API_BASE="https://your-compatible-endpoint/v1"
+export MANAGER_LLM_MODEL="gpt-4"
+```
+
 ## Quick Start
 
 ### 1. Full extraction + immediate merge
@@ -159,6 +170,8 @@ Important notes:
 - the CLI requires `LLM_API_KEY` for extraction paths, but not for `--merge-spool` or `--export`.
 - `--pool` is the simplest and recommended way to work with a single main pool.
 - `--core-pool` / `--extended-pool` are still supported for compatibility and optional split-pool workflows.
+- if `--pool` is omitted, writes default to `--pool-target extended`.
+- `--export` resolves to `--pool` when provided; otherwise it reads `--core-pool`.
 
 ## Python API
 
@@ -348,11 +361,14 @@ Main files:
 - `trace_evolve/manager.py`
 - `trace_evolve/pipeline.py`
 
-### 3. Spool-based extraction workflow
+## Current Behavior Details
+
+### Spool-based extraction workflow
 
 - extract-only and merge-only were split into explicit CLI/API paths
-- spool files are written as one completed JSONL file per extraction batch
+- one `extract_to_spool(...)` call writes one completed JSONL file after all batches finish
 - processed spool files move into `merged/`
+- `merge_spool(...)` loads all visible JSONL files first, merges them under a pool file lock, then moves processed files
 
 Main files:
 
@@ -361,22 +377,23 @@ Main files:
 - `trace_evolve/spool.py`
 - `trace_evolve/manager.py`
 
-### 4. Concurrent merge (two-phase)
+### Concurrent merge (two-phase)
 
-Pool merge was previously serial: each new experience called the LLM one at a time (~30s per call), so merging N experiences took N×30s. This was replaced with a two-phase concurrent approach:
+Pool merge uses a two-phase approach:
 
 - **Phase 1 (concurrent):** All new experiences are evaluated against the pool in parallel using `ThreadPoolExecutor(max_workers=min(N, 8))`. Each worker calls `_merge_single()` to get an LLM merge decision (INSERT / REPLACE / MERGE / SKIP). This phase is read-only against the pool.
-- **Phase 2 (serial):** Decisions are executed sequentially with conflict resolution. If a REPLACE or MERGE target was already removed by a prior operation in the same batch, the decision is downgraded to INSERT.
-
-This yields roughly 5× speedup for typical batches (e.g. 10 experiences: ~300s → ~60s).
+- **Phase 2 (serial):** Decisions are executed sequentially with conflict resolution. If a REPLACE / MERGE / DELETE target was already removed by a prior operation in the same batch, the decision is downgraded to `SKIP`.
+- `merge_spool(...)` also wraps the whole pool update in a filesystem lock (`fcntl.flock`) so separate processes do not write the same pool concurrently.
 
 Main files:
 
 - `trace_evolve/manager.py`
+- `trace_evolve/pipeline.py`
+- `trace_evolve/spool.py`
 
-### 5. History recording disabled
+### History recording compatibility
 
-The `history` list in `experience_pool.json` was consuming ~60% of file size (200+ KB of 340 KB total) and growing with every merge. History recording has been disabled: `record_operation()` is a no-op and `save()` writes `"history": []`. The pool JSON schema is preserved (top-level keys `experiences`, `history`, `metadata` are all still present) so downstream consumers are unaffected.
+Operation-history retention code still exists for compatibility, but the current runtime path does not record operations: `record_operation()` is a no-op and `save()` writes `"history": []`. The pool JSON schema is preserved (top-level keys `experiences`, `history`, and `metadata` are still present) so downstream consumers are unaffected.
 
 Main files:
 
