@@ -46,14 +46,29 @@ This version also supports QiMeng-Agent's embedded async extraction worker:
 
 ## Installation
 
+Recommended (uv):
+
+```bash
+# from traceEvolve/ root
+uv sync --python 3.8
+source .venv/bin/activate
+```
+
+This project now includes a `pyproject.toml`, so `uv sync` works directly.
+The default uv project environment is `.venv`.
+
+`uv sync` now installs both OpenAI and Ark SDK dependencies by default.
+
+Fallback (pip):
+
 ```bash
 pip install openai
 ```
 
-Optional Ark support:
+Ark support with pip:
 
 ```bash
-pip install volcengine-python-sdk
+pip install "volcengine-python-sdk[ark]"
 ```
 
 ## Environment
@@ -65,6 +80,13 @@ export LLM_MODEL="gpt-4"
 ```
 
 If you are following the current QiMeng-Agent integration, use `python3.8` when running `traceEvolve` commands.
+
+For uv users, run commands after activation:
+
+```bash
+source .venv/bin/activate
+python -m trace_evolve.cli --help
+```
 
 If you use `create_pipeline_from_env()`, it reads separate prefixes:
 

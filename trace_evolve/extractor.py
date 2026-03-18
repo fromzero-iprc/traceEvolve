@@ -506,10 +506,26 @@ class LLMClient:
         self._client = None
         self._use_ark = False
 
+    def _is_ark_provider(self) -> bool:
+        api_base = (self.config.api_base or "").strip().lower()
+        return any(token in api_base for token in ("ark", "volcengine", "volces"))
+
+    def ensure_provider_sdk(self) -> None:
+        """在真正执行前校验 provider 所需 SDK，缺失时直接报错。"""
+        if self._is_ark_provider():
+            try:
+                import volcenginesdkarkruntime  # noqa: F401
+            except ImportError as exc:
+                raise RuntimeError(
+                    "检测到正在使用火山引擎 API，但未安装对应 SDK。"
+                    "请先安装: pip install volcengine-python-sdk"
+                ) from exc
+
     def _get_client(self):
         """延迟初始化客户端"""
         if self._client is None:
-            if self.config.api_base and "ark" in self.config.api_base.lower():
+            self.ensure_provider_sdk()
+            if self._is_ark_provider():
                 self._use_ark = True
                 try:
                     from volcenginesdkarkruntime import Ark
