@@ -246,6 +246,8 @@ class ExperienceManager:
         self, new_experiences: List[Experience], batch_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """将新经验合并到经验池"""
+        self.llm_client.ensure_provider_sdk()
+
         if batch_id is None:
             batch_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 

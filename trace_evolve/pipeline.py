@@ -128,12 +128,23 @@ class EvolvePipeline:
                     print(f"  [错误] {error_msg}")
                     batch_result["errors"].append(error_msg)
                     results["errors"].append(error_msg)
+                    if self._is_fatal_merge_dependency_error(e):
+                        raise RuntimeError(error_msg) from e
 
         results["final_pool_size"] = len(self.manager.get_pool())
 
         self._save_final_report(results)
 
         return results
+
+    @staticmethod
+    def _is_fatal_merge_dependency_error(exc: Exception) -> bool:
+        message = str(exc)
+        return (
+            "火山引擎 API" in message
+            and "SDK" in message
+            and "volcengine-python-sdk" in message
+        )
 
     def _extract_batch(
         self,
