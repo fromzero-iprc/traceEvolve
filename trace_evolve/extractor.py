@@ -518,7 +518,7 @@ class LLMClient:
             except ImportError as exc:
                 raise RuntimeError(
                     "检测到正在使用火山引擎 API，但未安装对应 SDK。"
-                    "请先安装: pip install volcengine-python-sdk"
+                    '请先安装: pip install "volcengine-python-sdk[ark]"'
                 ) from exc
 
     def _get_client(self):
